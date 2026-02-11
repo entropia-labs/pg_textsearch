@@ -120,7 +120,8 @@ tp_add_document_to_posting_list(
 		TpLocalIndexState *local_state,
 		TpPostingList	  *posting_list,
 		ItemPointer		   ctid,
-		int32			   frequency)
+		int32			   frequency,
+		uint32			   tenant_id)
 {
 	TpPostingEntry *entries;
 	TpPostingEntry *new_entry;
@@ -167,7 +168,7 @@ tp_add_document_to_posting_list(
 	new_entry		= &entries[posting_list->doc_count];
 	new_entry->ctid = *ctid;
 	new_entry->frequency = frequency;
-	new_entry->tenant_id = 0;
+	new_entry->tenant_id = tenant_id;
 
 	posting_list->doc_count++;
 	posting_list->doc_freq	= posting_list->doc_count;

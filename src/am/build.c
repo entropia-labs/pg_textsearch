@@ -6,6 +6,7 @@
  */
 #include <postgres.h>
 
+#include <access/htup_details.h>
 #include <access/tableam.h>
 #include <catalog/namespace.h>
 #include <commands/progress.h>
@@ -550,7 +551,8 @@ tp_process_document_text(
 		Oid				   text_config_oid,
 		TpLocalIndexState *index_state,
 		Relation		   index_rel,
-		int32			  *doc_length_out)
+		int32			  *doc_length_out,
+		uint32			   tenant_id)
 {
 	char	*document_str;
 	Datum	 tsvector_datum;
@@ -597,7 +599,13 @@ tp_process_document_text(
 
 		/* Add document terms to posting lists */
 		tp_add_document_terms(
-				index_state, ctid, terms, frequencies, term_count, doc_length);
+				index_state,
+				ctid,
+				terms,
+				frequencies,
+				term_count,
+				doc_length,
+				tenant_id);
 
 		/*
 		 * Check memory after document completion and auto-spill if needed.
@@ -629,13 +637,15 @@ tp_process_document(
 		Oid				   text_config_oid,
 		TpLocalIndexState *index_state,
 		Relation		   index,
-		uint64			  *total_docs)
+		uint64			  *total_docs,
+		AttrNumber		   tenant_attnum)
 {
 	bool		isnull;
 	Datum		text_datum;
 	text	   *document_text;
 	ItemPointer ctid;
 	int32		doc_length;
+	uint32		tenant_id = 0;
 
 	/* Get the text column value (first indexed column) */
 	text_datum =
@@ -650,6 +660,15 @@ tp_process_document(
 	slot_getallattrs(slot);
 	ctid = &slot->tts_tid;
 
+	/* Extract tenant ID if tenant column is configured */
+	if (tenant_attnum != InvalidAttrNumber)
+	{
+		bool  tenant_isnull;
+		Datum tenant_datum = slot_getattr(slot, tenant_attnum, &tenant_isnull);
+		if (!tenant_isnull)
+			tenant_id = DatumGetUInt32(tenant_datum);
+	}
+
 	/* Process the document text using shared helper */
 	if (!tp_process_document_text(
 				document_text,
@@ -657,7 +676,8 @@ tp_process_document(
 				text_config_oid,
 				index_state,
 				index,
-				&doc_length))
+				&doc_length,
+				tenant_id))
 	{
 		return false;
 	}
@@ -732,6 +752,43 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	tp_build_init_metapage(index, text_config_oid, k1, b);
 
 	/*
+	 * Resolve tenant column if configured.
+	 * The tenant_column reloption stores the column name; we resolve it
+	 * to an attnum and store in the metapage for use at query time.
+	 */
+	AttrNumber tenant_attnum = InvalidAttrNumber;
+	{
+		TpOptions *options = (TpOptions *)index->rd_options;
+		if (options && options->tenant_column_offset > 0)
+		{
+			char *tenant_col_name = (char *)options +
+									options->tenant_column_offset;
+			tenant_attnum =
+					get_attnum(RelationGetRelid(heap), tenant_col_name);
+			if (tenant_attnum == InvalidAttrNumber)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_COLUMN),
+						 errmsg("tenant column \"%s\" does not exist",
+								tenant_col_name)));
+
+			/* Store attnum in metapage for query-time use */
+			{
+				Buffer			metabuf;
+				Page			page;
+				TpIndexMetaPage metap;
+
+				metabuf = ReadBuffer(index, TP_METAPAGE_BLKNO);
+				LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+				page  = BufferGetPage(metabuf);
+				metap = (TpIndexMetaPage)PageGetContents(page);
+				metap->tenant_column_attno = (uint32)tenant_attnum;
+				MarkBufferDirty(metabuf);
+				UnlockReleaseBuffer(metabuf);
+			}
+		}
+	}
+
+	/*
 	 * Check if parallel build is possible and beneficial.
 	 *
 	 * Postgres has already called plan_create_index_workers() and stored
@@ -794,7 +851,14 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 			}
 
 			return tp_build_parallel(
-					heap, index, indexInfo, text_config_oid, k1, b, nworkers);
+					heap,
+					index,
+					indexInfo,
+					text_config_oid,
+					k1,
+					b,
+					nworkers,
+					tenant_attnum);
 		}
 
 		if (reltuples >= TP_WARN_NO_PARALLEL_TUPLES && nworkers == 0)
@@ -847,7 +911,8 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 				text_config_oid,
 				index_state,
 				index,
-				&total_docs);
+				&total_docs,
+				tenant_attnum);
 
 		/* Report progress every TP_PROGRESS_REPORT_INTERVAL tuples */
 		if (total_docs % TP_PROGRESS_REPORT_INTERVAL == 0)
@@ -1073,7 +1138,6 @@ tp_insert(
 	int				   i;
 	TpLocalIndexState *index_state;
 
-	(void)heapRel;		  /* unused */
 	(void)checkUnique;	  /* unused */
 	(void)indexUnchanged; /* unused */
 	(void)indexInfo;	  /* unused */
@@ -1151,13 +1215,50 @@ tp_insert(
 				elog(WARNING, "Invalid TID in tp_insert, skipping");
 			else
 			{
+				/*
+				 * Extract tenant_id from heap tuple if tenant column
+				 * is configured. We read the metapage to get the
+				 * stored attnum.
+				 */
+				uint32 tenant_id = 0;
+				{
+					TpOptions *opts = (TpOptions *)index->rd_options;
+					if (opts && opts->tenant_column_offset > 0)
+					{
+						TpIndexMetaPage metap  = tp_get_metapage(index);
+						AttrNumber		tattno = (AttrNumber)
+													metap->tenant_column_attno;
+						pfree(metap);
+
+						if (tattno != InvalidAttrNumber)
+						{
+							TupleTableSlot *slot;
+							bool			got;
+
+							slot = table_slot_create(heapRel, NULL);
+							got	 = table_tuple_fetch_row_version(
+									 heapRel, ht_ctid, SnapshotAny, slot);
+							if (got)
+							{
+								bool  tisnull;
+								Datum tdatum =
+										slot_getattr(slot, tattno, &tisnull);
+								if (!tisnull)
+									tenant_id = DatumGetUInt32(tdatum);
+							}
+							ExecDropSingleTupleTableSlot(slot);
+						}
+					}
+				}
+
 				tp_add_document_terms(
 						index_state,
 						ht_ctid,
 						terms,
 						frequencies,
 						term_count,
-						doc_length);
+						doc_length,
+						tenant_id);
 
 				/* Auto-spill if memory limit exceeded */
 				tp_auto_spill_if_needed(index_state, index);

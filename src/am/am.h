@@ -38,6 +38,9 @@ typedef struct TpScanOpaqueData
 	/* LIMIT optimization */
 	int limit;			  /* Query LIMIT value, -1 if none */
 	int max_results_used; /* Internal limit used for current batch */
+
+	/* Tenant filtering */
+	uint32 tenant_id; /* Tenant ID filter (0 = no filter) */
 } TpScanOpaqueData;
 
 typedef TpScanOpaqueData *TpScanOpaque;
@@ -109,7 +112,8 @@ bool tp_process_document_text(
 		Oid				   text_config_oid,
 		TpLocalIndexState *index_state,
 		Relation		   index_rel,
-		int32			  *doc_length_out);
+		int32			  *doc_length_out,
+		uint32			   tenant_id);
 
 /* IDF sum calculation for average IDF */
 void tp_calculate_idf_sum(TpLocalIndexState *index_state);

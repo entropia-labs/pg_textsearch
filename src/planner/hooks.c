@@ -42,6 +42,7 @@
 #include <utils/rel.h>
 #include <utils/syscache.h>
 
+#include "am/am.h"
 #include "hooks.h"
 #include "query/score.h"
 #include "types/query.h"
@@ -664,6 +665,219 @@ resolve_indexes_in_subqueries(Query *query)
 	}
 }
 
+/*
+ * Try to extract an integer equality constant from WHERE clause
+ * for a given table column.
+ *
+ * Scans quals for `Var(varno, attnum) = Const(int)` and returns the
+ * constant value via *value_out.  Returns true if found.
+ */
+static bool
+find_equality_const_for_column(
+		Node *quals, Index varno, AttrNumber attnum, uint32 *value_out)
+{
+	List	 *qual_list;
+	ListCell *lc;
+
+	if (quals == NULL)
+		return false;
+
+	/* Flatten AND expressions into a list */
+	if (IsA(quals, BoolExpr) && ((BoolExpr *)quals)->boolop == AND_EXPR)
+		qual_list = ((BoolExpr *)quals)->args;
+	else
+		qual_list = list_make1(quals);
+
+	foreach (lc, qual_list)
+	{
+		Node   *node = (Node *)lfirst(lc);
+		OpExpr *op;
+		Node   *left;
+		Node   *right;
+		Var	   *var;
+		Const  *con;
+
+		if (!IsA(node, OpExpr))
+			continue;
+
+		op = (OpExpr *)node;
+		if (list_length(op->args) != 2)
+			continue;
+
+		left  = linitial(op->args);
+		right = lsecond(op->args);
+
+		/* Check Var = Const (either order) */
+		if (IsA(left, Var) && IsA(right, Const))
+		{
+			var = (Var *)left;
+			con = (Const *)right;
+		}
+		else if (IsA(left, Const) && IsA(right, Var))
+		{
+			var = (Var *)right;
+			con = (Const *)left;
+		}
+		else
+			continue;
+
+		/* Must be an integer constant */
+		if (con->constisnull)
+			continue;
+		if (con->consttype != INT4OID && con->consttype != INT8OID)
+			continue;
+
+		/* Must match the target column */
+		if (var->varno != varno || var->varattno != attnum)
+			continue;
+
+		/* Verify this is an equality operator */
+		{
+			char *opname = get_opname(op->opno);
+			if (opname == NULL || strcmp(opname, "=") != 0)
+				continue;
+		}
+
+		/* Extract the integer value */
+		if (con->consttype == INT4OID)
+			*value_out = (uint32)DatumGetInt32(con->constvalue);
+		else
+			*value_out = (uint32)DatumGetInt64(con->constvalue);
+
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * Get the tenant column attribute number for a BM25 index.
+ * Returns InvalidAttrNumber if the index has no tenant_column option.
+ *
+ * Opens the index relation briefly to read its reloptions.
+ */
+static AttrNumber
+get_index_tenant_attnum(Oid index_oid)
+{
+	Relation   index_rel;
+	TpOptions *options;
+	AttrNumber result = InvalidAttrNumber;
+	Oid		   heap_oid;
+	HeapTuple  idx_tuple;
+
+	/* Get the heap OID first */
+	idx_tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (!HeapTupleIsValid(idx_tuple))
+		return InvalidAttrNumber;
+	heap_oid = ((Form_pg_index)GETSTRUCT(idx_tuple))->indrelid;
+	ReleaseSysCache(idx_tuple);
+
+	/* Open the index to read options */
+	index_rel = index_open(index_oid, AccessShareLock);
+	options	  = (TpOptions *)index_rel->rd_options;
+
+	if (options && options->tenant_column_offset > 0)
+	{
+		char *tenant_col_name = (char *)options +
+								options->tenant_column_offset;
+		result = get_attnum(heap_oid, tenant_col_name);
+	}
+
+	index_close(index_rel, AccessShareLock);
+	return result;
+}
+
+/*
+ * Inject tenant_id from WHERE clause into bm25query constants.
+ *
+ * After index resolution, bm25query Consts have their index_oid set.
+ * This function scans the WHERE clause for equality predicates on the
+ * index's tenant_column and injects the value into the bm25query.
+ *
+ * This enables the index scan to filter by tenant at the posting list
+ * level rather than relying on the executor's recheck.
+ */
+static void
+inject_tenant_predicate(Query *query, BM25OidCache *oids)
+{
+	ListCell *lc;
+	Node	 *quals;
+
+	if (!query->jointree)
+		return;
+
+	quals = query->jointree->quals;
+	if (!quals)
+		return;
+
+	/* Walk target list looking for BM25 OpExpr with resolved index */
+	foreach (lc, query->targetList)
+	{
+		TargetEntry *tle = (TargetEntry *)lfirst(lc);
+		OpExpr		*opexpr;
+		Node		*left;
+		Node		*right;
+		Const		*constNode;
+		TpQuery		*tpquery;
+		Oid			 index_oid;
+		AttrNumber	 tenant_attnum;
+		Var			*var;
+		Oid			 relid;
+		AttrNumber	 col_attnum;
+		uint32		 tenant_id;
+		TpQuery		*new_tpquery;
+
+		if (!IsA(tle->expr, OpExpr))
+			continue;
+
+		opexpr = (OpExpr *)tle->expr;
+		if (opexpr->opno != oids->text_tpquery_operator_oid)
+			continue;
+		if (list_length(opexpr->args) != 2)
+			continue;
+
+		left  = linitial(opexpr->args);
+		right = lsecond(opexpr->args);
+
+		if (!IsA(left, Var) || !IsA(right, Const))
+			continue;
+
+		constNode = (Const *)right;
+		if (constNode->consttype != oids->tpquery_type_oid ||
+			constNode->constisnull)
+			continue;
+
+		tpquery	  = (TpQuery *)DatumGetPointer(constNode->constvalue);
+		index_oid = get_tpquery_index_oid(tpquery);
+		if (!OidIsValid(index_oid))
+			continue;
+
+		/* Already has a tenant_id set */
+		if (get_tpquery_tenant_id(tpquery) != 0)
+			continue;
+
+		/* Check if this index has a tenant_column */
+		tenant_attnum = get_index_tenant_attnum(index_oid);
+		if (tenant_attnum == InvalidAttrNumber)
+			continue;
+
+		/* Get the table OID from the Var */
+		var = (Var *)left;
+		if (!get_var_relation_and_attnum(var, query, &relid, &col_attnum))
+			continue;
+
+		/* Search WHERE clause for tenant_col = const */
+		if (!find_equality_const_for_column(
+					quals, var->varno, tenant_attnum, &tenant_id))
+			continue;
+
+		/* Inject tenant_id into the bm25query */
+		new_tpquery			  = create_tpquery_with_tenant(tpquery, tenant_id);
+		constNode->constvalue = PointerGetDatum(new_tpquery);
+		constNode->constlen	  = VARSIZE(new_tpquery);
+	}
+}
+
 static void
 resolve_indexes_in_query(Query *query)
 {
@@ -697,7 +911,16 @@ resolve_indexes_in_query(Query *query)
 	 * This avoids expensive plan tree walks for non-BM25 queries.
 	 */
 	if (context.found_bm25_operator)
+	{
 		query_has_bm25_operators = true;
+
+		/*
+		 * Inject tenant_id from WHERE clause into bm25query.
+		 * This must happen after index resolution so that the
+		 * bm25query constants have their index_oid set.
+		 */
+		inject_tenant_predicate(query, &oid_cache);
+	}
 }
 
 /*

@@ -63,6 +63,7 @@ static void tp_init_parallel_shared(
 		Relation			   index,
 		Oid					   text_config_oid,
 		AttrNumber			   attnum,
+		AttrNumber			   tenant_attnum,
 		double				   k1,
 		double				   b,
 		int					   nworkers,
@@ -82,7 +83,8 @@ static void tp_worker_process_document(
 		TpWorkerMemtableBuffer *buffer,
 		TupleTableSlot		   *slot,
 		int						attnum,
-		Oid						text_config_oid);
+		Oid						text_config_oid,
+		AttrNumber				tenant_attnum);
 
 static dshash_table *tp_worker_create_string_table(dsa_area *dsa);
 static dshash_table *tp_worker_create_doclength_table(dsa_area *dsa);
@@ -125,7 +127,8 @@ tp_build_parallel(
 		Oid		   text_config_oid,
 		double	   k1,
 		double	   b,
-		int		   nworkers)
+		int		   nworkers,
+		AttrNumber tenant_attnum)
 {
 	IndexBuildResult	  *result;
 	ParallelContext		  *pcxt;
@@ -186,6 +189,7 @@ tp_build_parallel(
 			index,
 			text_config_oid,
 			indexInfo->ii_IndexAttrNumbers[0],
+			tenant_attnum,
 			k1,
 			b,
 			nworkers,
@@ -356,6 +360,7 @@ tp_init_parallel_shared(
 		Relation			   index,
 		Oid					   text_config_oid,
 		AttrNumber			   attnum,
+		AttrNumber			   tenant_attnum,
 		double				   k1,
 		double				   b,
 		int					   nworkers,
@@ -371,6 +376,7 @@ tp_init_parallel_shared(
 	shared->indexrelid		= RelationGetRelid(index);
 	shared->text_config_oid = text_config_oid;
 	shared->attnum			= attnum;
+	shared->tenant_attnum	= tenant_attnum;
 	shared->k1				= k1;
 	shared->b				= b;
 	shared->nworkers		= nworkers;
@@ -515,7 +521,8 @@ tp_parallel_build_worker_main(
 				&my_state->buffers[active_buf],
 				slot,
 				shared->attnum,
-				shared->text_config_oid);
+				shared->text_config_oid,
+				shared->tenant_attnum);
 
 		pg_atomic_fetch_add_u64(&my_state->tuples_scanned, 1);
 
@@ -1836,7 +1843,8 @@ tp_worker_process_document(
 		TpWorkerMemtableBuffer *buffer,
 		TupleTableSlot		   *slot,
 		int						attnum,
-		Oid						text_config_oid)
+		Oid						text_config_oid,
+		AttrNumber				tenant_attnum)
 {
 	bool		  isnull;
 	Datum		  text_datum;
@@ -1849,6 +1857,7 @@ tp_worker_process_document(
 	int			  i;
 	dshash_table *string_table;
 	dshash_table *doclength_table;
+	uint32		  tenant_id = 0;
 
 	/* Get text value */
 	text_datum = slot_getattr(slot, attnum, &isnull);
@@ -1860,6 +1869,15 @@ tp_worker_process_document(
 
 	if (!ItemPointerIsValid(ctid))
 		return;
+
+	/* Extract tenant ID if tenant column is configured */
+	if (tenant_attnum != InvalidAttrNumber)
+	{
+		bool  tenant_isnull;
+		Datum tenant_datum = slot_getattr(slot, tenant_attnum, &tenant_isnull);
+		if (!tenant_isnull)
+			tenant_id = DatumGetUInt32(tenant_datum);
+	}
 
 	/* Tokenize document */
 	tsvector_datum = DirectFunctionCall2Coll(
@@ -2003,7 +2021,7 @@ tp_worker_process_document(
 		entries = dsa_get_address(dsa, posting_list->entries_dp);
 		entries[posting_list->doc_count].ctid	   = *ctid;
 		entries[posting_list->doc_count].frequency = frequency;
-		entries[posting_list->doc_count].tenant_id = 0;
+		entries[posting_list->doc_count].tenant_id = tenant_id;
 		posting_list->doc_count++;
 		posting_list->doc_freq = posting_list->doc_count;
 

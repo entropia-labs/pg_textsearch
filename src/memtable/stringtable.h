@@ -73,7 +73,8 @@ extern void tp_add_document_terms(
 		char			 **terms,
 		int32			  *frequencies,
 		int				   term_count,
-		int32			   doc_length);
+		int32			   doc_length,
+		uint32			   tenant_id);
 
 /* Posting list access via string table */
 extern TpPostingList *tp_string_table_get_posting_list(

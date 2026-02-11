@@ -65,7 +65,141 @@ FROM tenant_docs
 WHERE content <@> 'machine'::bm25query < 0
 ORDER BY score LIMIT 10;
 
+-- ============================================================
+-- SECTION 2b: Tenant-isolated queries (WHERE tenant_id = X)
+-- ============================================================
+
+-- Test: Tenant 1 only - should return only tenant 1's database docs
+SELECT id, tenant_id FROM tenant_docs
+WHERE content <@> 'database'::bm25query < 0 AND tenant_id = 1
+ORDER BY content <@> 'database'::bm25query LIMIT 10;
+
+-- Test: Tenant 2 only - should return only tenant 2's web docs
+SELECT id, tenant_id FROM tenant_docs
+WHERE content <@> 'web'::bm25query < 0 AND tenant_id = 2
+ORDER BY content <@> 'web'::bm25query LIMIT 10;
+
+-- Test: Tenant 3 only - should return only tenant 3's ML docs
+SELECT id, tenant_id FROM tenant_docs
+WHERE content <@> 'machine'::bm25query < 0 AND tenant_id = 3
+ORDER BY content <@> 'machine'::bm25query LIMIT 10;
+
+-- Test: Tenant filter with no matches - tenant 2 has no 'database' docs
+SELECT id, tenant_id FROM tenant_docs
+WHERE content <@> 'database'::bm25query < 0 AND tenant_id = 2
+ORDER BY content <@> 'database'::bm25query LIMIT 10;
+
+-- Test: Multi-term query with tenant filter
+SELECT id, tenant_id FROM tenant_docs
+WHERE content <@> 'web application'::bm25query < 0 AND tenant_id = 2
+ORDER BY content <@> 'web application'::bm25query LIMIT 10;
+
+-- Test: Without tenant filter returns all tenants (3 results)
+SELECT id, tenant_id FROM tenant_docs
+WHERE content <@> 'machine'::bm25query < 0
+ORDER BY content <@> 'machine'::bm25query LIMIT 10;
+
 DROP TABLE tenant_docs CASCADE;
+
+-- ============================================================
+-- SECTION 2c: Shared terms across tenants - prove real isolation
+-- ============================================================
+-- Every tenant has docs containing "server", so filtering must
+-- come from the index's tenant metadata, not from term absence.
+
+CREATE TABLE tenant_shared (
+    id SERIAL PRIMARY KEY,
+    content TEXT,
+    tenant_id INTEGER NOT NULL
+);
+
+CREATE INDEX tenant_shared_idx ON tenant_shared USING bm25(content)
+    WITH (text_config='english', tenant_column='tenant_id');
+
+INSERT INTO tenant_shared (content, tenant_id) VALUES
+    ('server monitoring tools', 1),
+    ('server backup strategy', 1),
+    ('server load balancing', 2),
+    ('server capacity planning', 2),
+    ('server security hardening', 3),
+    ('server disaster recovery', 3);
+
+-- Without filter: all 6 docs match "server"
+SELECT id, tenant_id, content <@> 'server'::bm25query as score
+FROM tenant_shared
+WHERE content <@> 'server'::bm25query < 0
+ORDER BY content <@> 'server'::bm25query, id LIMIT 10;
+
+-- Tenant 1 only: exactly 2 rows (ids 1,2)
+SELECT id, tenant_id FROM tenant_shared
+WHERE content <@> 'server'::bm25query < 0 AND tenant_id = 1
+ORDER BY content <@> 'server'::bm25query, id LIMIT 10;
+
+-- Tenant 2 only: exactly 2 rows (ids 3,4)
+SELECT id, tenant_id FROM tenant_shared
+WHERE content <@> 'server'::bm25query < 0 AND tenant_id = 2
+ORDER BY content <@> 'server'::bm25query, id LIMIT 10;
+
+-- Tenant 3 only: exactly 2 rows (ids 5,6)
+SELECT id, tenant_id FROM tenant_shared
+WHERE content <@> 'server'::bm25query < 0 AND tenant_id = 3
+ORDER BY content <@> 'server'::bm25query, id LIMIT 10;
+
+-- Non-existent tenant: 0 rows
+SELECT id, tenant_id FROM tenant_shared
+WHERE content <@> 'server'::bm25query < 0 AND tenant_id = 999
+ORDER BY content <@> 'server'::bm25query, id LIMIT 10;
+
+DROP TABLE tenant_shared CASCADE;
+
+-- ============================================================
+-- SECTION 2d: BM25 scores use global stats (not per-tenant)
+-- ============================================================
+-- Verify that BM25 scores are identical whether or not a tenant
+-- filter is applied, because avg_doc_length and total_docs are
+-- global across all tenants. This documents current behavior.
+
+CREATE TABLE tenant_scores (
+    id SERIAL PRIMARY KEY,
+    content TEXT,
+    tenant_id INTEGER NOT NULL
+);
+
+CREATE INDEX tenant_scores_idx ON tenant_scores USING bm25(content)
+    WITH (text_config='english', tenant_column='tenant_id');
+
+-- Tenant 1: short docs (2 terms each)
+INSERT INTO tenant_scores (content, tenant_id) VALUES
+    ('quick fox', 1),
+    ('quick dog', 1);
+
+-- Tenant 2: long docs (many terms each) — these inflate avg_doc_length
+INSERT INTO tenant_scores (content, tenant_id) VALUES
+    ('quick brown fox jumps over the lazy dog in the park near the river', 2),
+    ('quick red fox runs across the wide open field under the bright sun', 2);
+
+-- Score for tenant 1 with filter: uses global avg_doc_length
+SELECT id, tenant_id,
+       content <@> 'quick'::bm25query as score
+FROM tenant_scores
+WHERE content <@> 'quick'::bm25query < 0 AND tenant_id = 1
+ORDER BY content <@> 'quick'::bm25query, id;
+
+-- Score for tenant 2 with filter: uses same global avg_doc_length
+SELECT id, tenant_id,
+       content <@> 'quick'::bm25query as score
+FROM tenant_scores
+WHERE content <@> 'quick'::bm25query < 0 AND tenant_id = 2
+ORDER BY content <@> 'quick'::bm25query, id;
+
+-- Score without any tenant filter: all 4 rows, same scores as above
+SELECT id, tenant_id,
+       content <@> 'quick'::bm25query as score
+FROM tenant_scores
+WHERE content <@> 'quick'::bm25query < 0
+ORDER BY content <@> 'quick'::bm25query, id;
+
+DROP TABLE tenant_scores CASCADE;
 
 -- ============================================================
 -- SECTION 3: Tenant-enabled index with segment spill

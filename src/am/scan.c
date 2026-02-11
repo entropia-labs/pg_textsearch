@@ -398,11 +398,12 @@ tp_rescan_process_orderby(
 			}
 			else
 			{
-				/* bm25query - extract query text and index OID */
+				/* bm25query - extract query text, index OID, tenant */
 				TpQuery *query = (TpQuery *)DatumGetPointer(query_datum);
 
 				query_cstr		= pstrdup(get_tpquery_text(query));
 				query_index_oid = get_tpquery_index_oid(query);
+				so->tenant_id	= get_tpquery_tenant_id(query);
 
 				/* Validate index OID if provided in query */
 				if (tpquery_has_index(query))

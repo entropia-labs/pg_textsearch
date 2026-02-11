@@ -92,7 +92,8 @@ extern void tp_local_memtable_add_term(
 		const char		*term,
 		int				 term_len,
 		ItemPointer		 ctid,
-		int32			 frequency);
+		int32			 frequency,
+		uint32			 tenant_id);
 
 extern void tp_local_memtable_store_doc_length(
 		TpLocalMemtable *memtable, ItemPointer ctid, int32 doc_length);

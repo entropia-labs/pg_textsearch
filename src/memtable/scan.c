@@ -108,7 +108,8 @@ tp_memtable_search(
 			b_value,
 			max_results,
 			so->result_ctids,
-			&so->result_scores);
+			&so->result_scores,
+			so->tenant_id);
 
 	so->result_count	 = result_count;
 	so->current_pos		 = 0;

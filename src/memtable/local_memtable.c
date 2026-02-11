@@ -234,7 +234,8 @@ tp_local_memtable_add_term(
 		const char		*term,
 		int				 term_len,
 		ItemPointer		 ctid,
-		int32			 frequency)
+		int32			 frequency,
+		uint32			 tenant_id)
 {
 	TpLocalPosting *posting;
 	TpPostingEntry *entry;
@@ -263,7 +264,7 @@ tp_local_memtable_add_term(
 	entry			 = &posting->entries[posting->doc_count];
 	entry->ctid		 = *ctid;
 	entry->frequency = frequency;
-	entry->tenant_id = 0;
+	entry->tenant_id = tenant_id;
 
 	posting->doc_count++;
 	memtable->total_postings++;

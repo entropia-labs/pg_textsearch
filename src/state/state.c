@@ -957,7 +957,22 @@ tp_rebuild_posting_lists_from_docids(
 
 			if (!isnull)
 			{
+				uint32 tenant_id = 0;
+
 				document_text = DatumGetTextPP(text_datum);
+
+				/* Extract tenant_id if configured */
+				if (metap->tenant_column_attno != 0)
+				{
+					bool  tisnull;
+					Datum tdatum = heap_getattr(
+							tuple,
+							(AttrNumber)metap->tenant_column_attno,
+							RelationGetDescr(heap_rel),
+							&tisnull);
+					if (!tisnull)
+						tenant_id = DatumGetUInt32(tdatum);
+				}
 
 				/*
 				 * Use shared helper to process document text and rebuild
@@ -970,7 +985,8 @@ tp_rebuild_posting_lists_from_docids(
 							metap->text_config_oid,
 							local_state,
 							NULL, /* No auto-spill during recovery */
-							&doc_length))
+							&doc_length,
+							tenant_id))
 				{
 					/* Update corpus statistics */
 					local_state->shared->total_docs++;

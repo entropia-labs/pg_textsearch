@@ -474,7 +474,8 @@ tp_add_document_terms(
 		char			 **terms,
 		int32			  *frequencies,
 		int				   term_count,
-		int32			   doc_length)
+		int32			   doc_length,
+		uint32			   tenant_id)
 {
 	int i;
 
@@ -488,7 +489,7 @@ tp_add_document_terms(
 
 		/* Add document entry to posting list */
 		tp_add_document_to_posting_list(
-				local_state, posting_list, ctid, frequency);
+				local_state, posting_list, ctid, frequency, tenant_id);
 	}
 
 	/* Store document length in the document length table */

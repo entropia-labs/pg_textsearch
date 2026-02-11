@@ -97,9 +97,11 @@ typedef struct TpParallelBuildShared
 	Oid		   indexrelid;		/* Index relation OID */
 	Oid		   text_config_oid; /* Text search configuration OID */
 	AttrNumber attnum;			/* Attribute number of indexed column */
-	double	   k1;				/* BM25 k1 parameter */
-	double	   b;				/* BM25 b parameter */
-	int32	   nworkers;		/* Number of background workers (not including
+	AttrNumber tenant_attnum;	/* Attribute number of tenant column
+								   (InvalidAttrNumber if none) */
+	double k1;					/* BM25 k1 parameter */
+	double b;					/* BM25 b parameter */
+	int32  nworkers;			/* Number of background workers (not including
 								   leader) */
 
 	/* DSA for shared memtable allocations */
@@ -159,7 +161,8 @@ extern struct IndexBuildResult *tp_build_parallel(
 		Oid				  text_config_oid,
 		double			  k1,
 		double			  b,
-		int				  nworkers);
+		int				  nworkers,
+		AttrNumber		  tenant_attnum);
 
 /* Worker entry point (called by parallel infrastructure) */
 extern PGDLLEXPORT void

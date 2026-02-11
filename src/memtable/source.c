@@ -58,10 +58,15 @@ memtable_get_postings(TpDataSource *source, const char *term)
 	data->doc_freq = posting_list->doc_freq > 0 ? posting_list->doc_freq
 												: posting_list->doc_count;
 
+	/* Allocate tenant_ids array for tenant-aware indexes */
+	data->tenant_ids = (uint32 *)palloc(
+			posting_list->doc_count * sizeof(uint32));
+
 	for (i = 0; i < posting_list->doc_count; i++)
 	{
 		data->ctids[i]		 = entries[i].ctid;
 		data->frequencies[i] = entries[i].frequency;
+		data->tenant_ids[i]	 = entries[i].tenant_id;
 	}
 
 	return data;

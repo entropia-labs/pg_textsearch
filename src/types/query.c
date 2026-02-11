@@ -272,14 +272,13 @@ tpquery_recv(PG_FUNCTION_ARGS)
 
 	/* Read and validate version */
 	version = pq_getmsgbyte(buf);
-	if (version != 1 && version != 2)
+	if (version < 1 || version > 3)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("unsupported bm25query binary format version %u",
 						version),
-				 errhint("Expected version 1 or 2. This may indicate data "
-						 "from "
-						 "an incompatible pg_textsearch version.")));
+				 errhint("Expected version 1-3. This may indicate data "
+						 "from an incompatible pg_textsearch version.")));
 
 	/* Read flags for v2+ */
 	if (version >= 2)
@@ -287,6 +286,11 @@ tpquery_recv(PG_FUNCTION_ARGS)
 
 	index_oid	   = pq_getmsgint(buf, sizeof(Oid));
 	query_text_len = pq_getmsgint(buf, sizeof(int32));
+
+	/* Read tenant_id for v3+ */
+	uint32 tenant_id = 0;
+	if (version >= 3)
+		tenant_id = pq_getmsgint(buf, sizeof(uint32));
 
 	/* Validate length to prevent unbounded memory allocation */
 	if (query_text_len < 0 || query_text_len > 1000000) /* 1MB limit */
@@ -300,6 +304,7 @@ tpquery_recv(PG_FUNCTION_ARGS)
 
 	explicit_index = (flags & TPQUERY_FLAG_EXPLICIT_INDEX) != 0;
 	result = create_tpquery_explicit(query_text, index_oid, explicit_index);
+	result->tenant_id = tenant_id;
 	pfree(query_text);
 
 	PG_RETURN_POINTER(result);
@@ -322,6 +327,7 @@ tpquery_send(PG_FUNCTION_ARGS)
 	pq_sendint8(&buf, tpquery->flags);
 	pq_sendint32(&buf, tpquery->index_oid);
 	pq_sendint32(&buf, tpquery->query_text_len);
+	pq_sendint32(&buf, tpquery->tenant_id);
 
 	query_text = get_tpquery_text(tpquery);
 	pq_sendbytes(&buf, query_text, tpquery->query_text_len);
@@ -1053,6 +1059,7 @@ create_tpquery_explicit(
 	result->flags		   = explicit_index ? TPQUERY_FLAG_EXPLICIT_INDEX : 0;
 	result->index_oid	   = index_oid;
 	result->query_text_len = query_text_len;
+	result->tenant_id	   = 0;
 
 	/* Copy query text */
 	memcpy(result->data, query_text, query_text_len);
@@ -1139,6 +1146,33 @@ tpquery_is_explicit_index(TpQuery *tpquery)
 	if (tpquery->version < 2)
 		return false;
 	return (tpquery->flags & TPQUERY_FLAG_EXPLICIT_INDEX) != 0;
+}
+
+/*
+ * Get tenant ID from tpquery (0 = no tenant filter)
+ */
+uint32
+get_tpquery_tenant_id(TpQuery *tpquery)
+{
+	/* Version < 3 didn't have tenant_id */
+	if (tpquery->version < 3)
+		return 0;
+	return tpquery->tenant_id;
+}
+
+/*
+ * Create a copy of a tpquery with tenant_id set.
+ * Used by the planner hook to inject tenant filter.
+ */
+TpQuery *
+create_tpquery_with_tenant(TpQuery *original, uint32 tenant_id)
+{
+	int		 total_size = VARSIZE(original);
+	TpQuery *result		= (TpQuery *)palloc(total_size);
+
+	memcpy(result, original, total_size);
+	result->tenant_id = tenant_id;
+	return result;
 }
 
 /*

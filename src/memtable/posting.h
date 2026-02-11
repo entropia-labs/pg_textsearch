@@ -42,7 +42,8 @@ extern void tp_add_document_to_posting_list(
 		TpLocalIndexState *local_state,
 		TpPostingList	  *posting_list,
 		ItemPointer		   ctid,
-		int32			   frequency);
+		int32			   frequency,
+		uint32			   tenant_id);
 
 /* Document length hash table tranche ID */
 #define TP_DOCLENGTH_HASH_TRANCHE_ID (LWTRANCHE_FIRST_USER_DEFINED + 1)

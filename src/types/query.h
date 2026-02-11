@@ -17,8 +17,9 @@
  *   0: Pre-0.0.6 format with index_name string (no longer supported)
  *   1: 0.0.6+ format with index_oid
  *   2: 0.5.0+ adds explicit_index flag
+ *   3: 1.0.0+ adds tenant_id for multi-tenant filtering
  */
-#define TPQUERY_VERSION 2
+#define TPQUERY_VERSION 3
 
 /*
  * Flags for TpQuery
@@ -34,13 +35,15 @@
  */
 typedef struct TpQuery
 {
-	int32 vl_len_;					   /* varlena header (must be first) */
-	uint8 version;					   /* binary format version */
-	uint8 flags;					   /* flags (TPQUERY_FLAG_*) */
-	Oid	  index_oid;				   /* resolved index OID (InvalidOid if
-										* unresolved) */
-	int32 query_text_len;			   /* length of query text */
-	char  data[FLEXIBLE_ARRAY_MEMBER]; /* payload: query text only */
+	int32 vl_len_;					  /* varlena header (must be first) */
+	uint8 version;					  /* binary format version */
+	uint8 flags;					  /* flags (TPQUERY_FLAG_*) */
+	Oid	  index_oid;				  /* resolved index OID (InvalidOid if
+									   * unresolved) */
+	int32  query_text_len;			  /* length of query text */
+	uint32 tenant_id;				  /* tenant ID for filtering (0 = no
+									   * filter) */
+	char data[FLEXIBLE_ARRAY_MEMBER]; /* payload: query text only */
 } TpQuery;
 
 /* Macro for accessing query text */
@@ -71,3 +74,5 @@ Oid	  get_tpquery_index_oid(TpQuery *tpquery);
 char *get_tpquery_text(TpQuery *tpquery);
 bool  tpquery_has_index(TpQuery *tpquery);
 bool  tpquery_is_explicit_index(TpQuery *tpquery);
+uint32	 get_tpquery_tenant_id(TpQuery *tpquery);
+TpQuery *create_tpquery_with_tenant(TpQuery *original, uint32 tenant_id);

@@ -413,7 +413,8 @@ score_memtable_single_term(
 		float4			   k1,
 		float4			   b,
 		float4			   avg_doc_len,
-		TpBMWStats		  *stats)
+		TpBMWStats		  *stats,
+		uint32			   tenant_id)
 {
 	TpDataSource  *source;
 	TpPostingData *postings;
@@ -441,6 +442,11 @@ score_memtable_single_term(
 		int32			 tf	  = postings->frequencies[i];
 		int32			 doc_len;
 		float4			 score;
+
+		/* Skip documents not matching tenant filter */
+		if (tenant_id != 0 && postings->tenant_ids != NULL &&
+			postings->tenant_ids[i] != tenant_id)
+			continue;
 
 		/* Get document length */
 		doc_len = tp_source_get_doc_length(source, ctid);
@@ -568,7 +574,8 @@ tp_score_single_term_bmw(
 		int				   max_results,
 		ItemPointerData	  *result_ctids,
 		float4			  *result_scores,
-		TpBMWStats		  *stats)
+		TpBMWStats		  *stats,
+		uint32			   tenant_id)
 {
 	TpTopKHeap		heap;
 	TpIndexMetaPage metap;
@@ -585,7 +592,15 @@ tp_score_single_term_bmw(
 
 	/* Score memtable (exhaustive - no skip index) */
 	score_memtable_single_term(
-			&heap, local_state, term, idf, k1, b, avg_doc_len, stats);
+			&heap,
+			local_state,
+			term,
+			idf,
+			k1,
+			b,
+			avg_doc_len,
+			stats,
+			tenant_id);
 
 	/* Get segment level heads from metapage */
 	metap = tp_get_metapage(index);
@@ -671,7 +686,8 @@ score_memtable_multi_term(
 		float4			   k1,
 		float4			   b,
 		float4			   avg_doc_len,
-		TpBMWStats		  *stats)
+		TpBMWStats		  *stats,
+		uint32			   tenant_id)
 {
 	TpDataSource *source;
 	HTAB		 *doc_accum;
@@ -715,6 +731,11 @@ score_memtable_multi_term(
 			float4				term_score;
 			DocumentScoreEntry *entry;
 			bool				found;
+
+			/* Skip documents not matching tenant filter */
+			if (tenant_id != 0 && postings->tenant_ids != NULL &&
+				postings->tenant_ids[i] != tenant_id)
+				continue;
 
 			/* Get document length */
 			doc_len = tp_source_get_doc_length(source, ctid);
@@ -1429,7 +1450,8 @@ tp_score_multi_term_bmw(
 		int				   max_results,
 		ItemPointerData	  *result_ctids,
 		float4			  *result_scores,
-		TpBMWStats		  *stats)
+		TpBMWStats		  *stats,
+		uint32			   tenant_id)
 {
 	TpTopKHeap		heap;
 	TpIndexMetaPage metap;
@@ -1457,7 +1479,15 @@ tp_score_multi_term_bmw(
 
 	/* Score memtable (exhaustive - no skip index) */
 	score_memtable_multi_term(
-			&heap, local_state, terms, term_count, k1, b, avg_doc_len, stats);
+			&heap,
+			local_state,
+			terms,
+			term_count,
+			k1,
+			b,
+			avg_doc_len,
+			stats,
+			tenant_id);
 
 	/* Get segment level heads from metapage */
 	metap = tp_get_metapage(index);

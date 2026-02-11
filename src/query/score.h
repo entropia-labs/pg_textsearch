@@ -33,7 +33,8 @@ extern int tp_score_documents(
 		float4			   b,
 		int				   max_results,
 		ItemPointer		   result_ctids,
-		float4			 **result_scores);
+		float4			 **result_scores,
+		uint32			   tenant_id);
 
 /* IDF calculation */
 extern float4 tp_calculate_idf(int32 doc_freq, int32 total_docs);

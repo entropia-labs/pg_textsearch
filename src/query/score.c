@@ -409,7 +409,8 @@ tp_score_documents(
 		float4			   b,
 		int				   max_results,
 		ItemPointer		   result_ctids,
-		float4			 **result_scores)
+		float4			 **result_scores,
+		uint32			   tenant_id)
 {
 	HTAB				*doc_scores_hash;
 	DocumentScoreEntry **sorted_docs;
@@ -493,7 +494,8 @@ tp_score_documents(
 				max_results,
 				result_ctids,
 				scores,
-				&stats);
+				&stats,
+				tenant_id);
 
 		/* Log BMW stats if enabled */
 		if (tp_log_bmw_stats)
@@ -569,7 +571,8 @@ tp_score_documents(
 				max_results,
 				result_ctids,
 				scores,
-				&stats);
+				&stats,
+				tenant_id);
 
 		pfree(idfs);
 
@@ -647,6 +650,11 @@ tp_score_documents(
 				DocumentScoreEntry *doc_entry;
 				bool				found;
 				int32				doc_len_int;
+
+				/* Skip documents not matching tenant filter */
+				if (tenant_id != 0 && postings->tenant_ids != NULL &&
+					postings->tenant_ids[i] != tenant_id)
+					continue;
 
 				/* Validate TID first */
 				if (!ItemPointerIsValid(ctid))

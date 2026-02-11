@@ -134,7 +134,8 @@ extern int tp_score_single_term_bmw(
 		int				   max_results,
 		ItemPointerData	  *result_ctids,
 		float4			  *result_scores,
-		TpBMWStats		  *stats);
+		TpBMWStats		  *stats,
+		uint32			   tenant_id);
 
 /*
  * Score documents using multi-term Block-Max WAND.
@@ -157,7 +158,8 @@ extern int tp_score_multi_term_bmw(
 		int				   max_results,
 		ItemPointerData	  *result_ctids,
 		float4			  *result_scores,
-		TpBMWStats		  *stats);
+		TpBMWStats		  *stats,
+		uint32			   tenant_id);
 
 /*
  * Compute block maximum BM25 score from skip entry metadata.
