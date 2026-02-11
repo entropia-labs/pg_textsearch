@@ -23,6 +23,7 @@ tp_alloc_posting_data(int32 capacity)
 	data->ctids = (ItemPointerData *)palloc(
 			capacity * sizeof(ItemPointerData));
 	data->frequencies = (int32 *)palloc(capacity * sizeof(int32));
+	data->tenant_ids  = NULL; /* Allocated on demand for tenant indexes */
 	data->count		  = 0;
 	data->doc_freq	  = 0;
 
@@ -41,6 +42,8 @@ tp_free_posting_data(TpPostingData *data)
 			pfree(data->ctids);
 		if (data->frequencies)
 			pfree(data->frequencies);
+		if (data->tenant_ids)
+			pfree(data->tenant_ids);
 		pfree(data);
 	}
 }

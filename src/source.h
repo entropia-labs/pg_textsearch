@@ -21,6 +21,7 @@ typedef struct TpPostingData
 {
 	ItemPointerData *ctids;		  /* Array of document CTIDs */
 	int32			*frequencies; /* Array of term frequencies */
+	uint32			*tenant_ids;  /* Array of tenant IDs (NULL if none) */
 	int32			 count;		  /* Number of entries */
 	int32			 doc_freq;	  /* Document frequency (for IDF) */
 } TpPostingData;

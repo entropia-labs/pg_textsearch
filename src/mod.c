@@ -241,6 +241,13 @@ _PG_init(void)
 			0.0,
 			1.0,
 			NoLock);
+	add_string_reloption(
+			tp_relopt_kind,
+			"tenant_column",
+			"Column name for multi-tenant filtering",
+			NULL,
+			NULL,
+			NoLock);
 
 	/*
 	 * Install shared memory hooks (needed for registry)

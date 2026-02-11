@@ -134,7 +134,11 @@ tp_options(Datum reloptions, bool validate)
 			  offsetof(TpOptions, text_config_offset),
 			  0},
 			 {"k1", RELOPT_TYPE_REAL, offsetof(TpOptions, k1), 0},
-			 {"b", RELOPT_TYPE_REAL, offsetof(TpOptions, b), 0}};
+			 {"b", RELOPT_TYPE_REAL, offsetof(TpOptions, b), 0},
+			 {"tenant_column",
+			  RELOPT_TYPE_STRING,
+			  offsetof(TpOptions, tenant_column_offset),
+			  0}};
 
 	return (bytea *)build_reloptions(
 			reloptions,

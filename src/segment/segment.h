@@ -44,7 +44,9 @@ typedef struct TpPageIndexSpecial
 /*
  * Segment format version
  */
-#define TP_SEGMENT_FORMAT_VERSION 3 /* Block compression support */
+#define TP_SEGMENT_FORMAT_V3	  3 /* Block compression support */
+#define TP_SEGMENT_FORMAT_V4	  4 /* Multi-tenant support */
+#define TP_SEGMENT_FORMAT_VERSION 4 /* Current version */
 
 /*
  * Segment header - stored on the first page
@@ -82,6 +84,12 @@ typedef struct TpSegmentHeader
 
 	/* Page index reference */
 	BlockNumber page_index; /* First page of the page index */
+
+	/* V4 extensions: multi-tenant support */
+	uint32 tenant_map_offset;	  /* Offset to tenant_id table (uint32/doc) */
+	uint32 tenant_stats_offset;	  /* Offset to per-tenant stats */
+	uint32 tenant_docfreq_offset; /* Offset to per-term per-tenant doc_freq */
+	uint32 flags;				  /* Bit 0: has_tenant_data */
 } TpSegmentHeader;
 
 /*
@@ -167,8 +175,42 @@ typedef struct TpSkipEntry
 	uint8  block_max_norm; /* Fieldnorm ID of max-scoring doc (for BMW) */
 	uint32 posting_offset; /* Byte offset from segment start to block data */
 	uint8  flags;		   /* Compression type, etc. */
-	uint8  reserved[3];	   /* Future use, ensures 16-byte alignment */
+	/*
+	 * Reserved bytes encode tenant info in V4:
+	 *   [0] = tenant_mode: 0=none, 1=single-tenant, 2=mixed
+	 *   [1..2] = tenant_id_low16 (lower 16 bits of tenant_id)
+	 */
+	uint8 reserved[3];
 } __attribute__((packed)) TpSkipEntry;
+
+/* Tenant mode values for skip entry reserved[0] */
+#define TP_TENANT_MODE_NONE	  0
+#define TP_TENANT_MODE_SINGLE 1
+#define TP_TENANT_MODE_MIXED  2
+
+/* V4 header flags */
+#define TP_FLAG_HAS_TENANT_DATA 0x01
+
+/*
+ * Per-tenant corpus statistics.
+ * Stored in the tenant_stats section of V4 segments.
+ */
+typedef struct TpTenantStats
+{
+	uint32 tenant_id;
+	uint32 num_docs;
+	uint64 total_tokens;
+} TpTenantStats;
+
+/*
+ * Per-term per-tenant document frequency.
+ * Stored in the tenant_docfreq section of V4 segments.
+ */
+typedef struct TpTenantDocFreq
+{
+	uint32 tenant_id;
+	uint32 doc_freq;
+} TpTenantDocFreq;
 
 /* Skip entry flags */
 #define TP_BLOCK_FLAG_UNCOMPRESSED 0x00 /* Raw doc IDs and frequencies */

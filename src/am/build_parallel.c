@@ -2003,6 +2003,7 @@ tp_worker_process_document(
 		entries = dsa_get_address(dsa, posting_list->entries_dp);
 		entries[posting_list->doc_count].ctid	   = *ctid;
 		entries[posting_list->doc_count].frequency = frequency;
+		entries[posting_list->doc_count].tenant_id = 0;
 		posting_list->doc_count++;
 		posting_list->doc_freq = posting_list->doc_count;
 

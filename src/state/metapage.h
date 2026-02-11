@@ -48,6 +48,11 @@ typedef struct TpIndexMetaPageData
 	BlockNumber level_heads[TP_MAX_LEVELS]; /* Head of segment chain per level
 											 */
 	uint16 level_counts[TP_MAX_LEVELS];		/* Segment count per level */
+
+	/* V6 extensions: multi-tenant support */
+	uint32 tenant_column_attno;			 /* Attribute number of tenant column
+										  * (0 = no tenancy) */
+	BlockNumber first_tenant_stats_page; /* First page of tenant stats chain */
 } TpIndexMetaPageData;
 
 typedef TpIndexMetaPageData *TpIndexMetaPage;

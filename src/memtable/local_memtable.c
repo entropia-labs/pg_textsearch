@@ -263,6 +263,7 @@ tp_local_memtable_add_term(
 	entry			 = &posting->entries[posting->doc_count];
 	entry->ctid		 = *ctid;
 	entry->frequency = frequency;
+	entry->tenant_id = 0;
 
 	posting->doc_count++;
 	memtable->total_postings++;

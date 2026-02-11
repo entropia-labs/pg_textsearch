@@ -45,10 +45,11 @@ typedef TpScanOpaqueData *TpScanOpaque;
 /* Index options structure */
 typedef struct TpOptions
 {
-	int32  vl_len_;			   /* varlena header (do not touch directly!) */
-	int32  text_config_offset; /* offset to text config string */
-	double k1;				   /* BM25 k1 parameter */
-	double b;				   /* BM25 b parameter */
+	int32  vl_len_;				 /* varlena header (do not touch directly!) */
+	int32  text_config_offset;	 /* offset to text config string */
+	double k1;					 /* BM25 k1 parameter */
+	double b;					 /* BM25 b parameter */
+	int32  tenant_column_offset; /* offset to tenant column name (0=none) */
 } TpOptions;
 
 /* Tapir-specific build phases for progress reporting */

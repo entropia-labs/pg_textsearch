@@ -21,4 +21,5 @@ typedef struct TpPostingEntry
 {
 	ItemPointerData ctid;	   /* Document heap tuple ID */
 	int32			frequency; /* Term frequency in document */
+	uint32			tenant_id; /* Tenant ID (0 if no tenancy) */
 } TpPostingEntry;

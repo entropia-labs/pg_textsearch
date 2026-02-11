@@ -167,6 +167,7 @@ tp_add_document_to_posting_list(
 	new_entry		= &entries[posting_list->doc_count];
 	new_entry->ctid = *ctid;
 	new_entry->frequency = frequency;
+	new_entry->tenant_id = 0;
 
 	posting_list->doc_count++;
 	posting_list->doc_freq	= posting_list->doc_count;

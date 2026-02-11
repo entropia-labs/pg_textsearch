@@ -92,6 +92,10 @@ tp_init_metapage(Page page, Oid text_config_oid)
 		metap->level_counts[i] = 0;
 	}
 
+	/* V6: multi-tenant fields */
+	metap->tenant_column_attno	   = 0; /* 0 = no tenancy */
+	metap->first_tenant_stats_page = InvalidBlockNumber;
+
 	/* Update page header to reflect that we've used space for metapage */
 	phdr		   = (PageHeader)page;
 	phdr->pd_lower = SizeOfPageHeaderData + sizeof(TpIndexMetaPageData);
