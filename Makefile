@@ -61,7 +61,7 @@ RUST_STATICLIB = $(RUST_SRCDIR)/target/release/libpg_textsearch_rust.a
 SHLIB_LINK += $(RUST_STATICLIB)
 
 # Test configuration
-REGRESS = aerodocs basic binary_io bmw compression concurrent_build coverage deletion vacuum dropped empty implicit index inheritance limits lock manyterms memory merge mixed parallel_build partitioned partitioned_many queries rescan schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security segment segment_integrity strings unsupported updates vector unlogged_index wand text_config
+REGRESS = aerodocs basic binary_io bmw compression concurrent_build coverage deletion vacuum dropped empty implicit index inheritance limits lock manyterms memory merge mixed parallel_build partitioned partitioned_many queries rescan schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security segment segment_integrity strings tenant unsupported updates vector unlogged_index wand text_config
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG = pg_config
