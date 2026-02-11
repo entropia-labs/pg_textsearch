@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     paths:
       - 'src/**'
+      - 'rust/**'
       - 'test/**'
       - 'sql/**'
       - 'Makefile'
@@ -15,6 +16,7 @@ on:
     branches: [ main ]
     paths:
       - 'src/**'
+      - 'rust/**'
       - 'test/**'
       - 'sql/**'
       - 'Makefile'
@@ -54,6 +56,19 @@ jobs:
     - name: Install build dependencies
       run: |
         sudo apt-get install -y build-essential bc
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          rust/target
+        key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+        restore-keys: rust-${{ runner.os }}-
 
     - name: Start PostgreSQL
       run: |
@@ -189,6 +204,19 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y postgresql-${{ matrix.config.pg_version }} postgresql-server-dev-${{ matrix.config.pg_version }}
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          rust/target
+        key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+        restore-keys: rust-${{ runner.os }}-
+
     - name: Build with ${{ matrix.config.cc }}
       run: |
         export PATH="/usr/lib/postgresql/${{ matrix.config.pg_version }}/bin:$PATH"
@@ -216,6 +244,19 @@ jobs:
         sudo systemctl start postgresql
         sudo -u postgres createuser -s $USER
         sudo -u postgres createdb $USER
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          rust/target
+        key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+        restore-keys: rust-${{ runner.os }}-
 
     - name: Build and install extension
       run: |
@@ -390,6 +431,19 @@ jobs:
         fi
         rm -f test_sanitizer test_sanitizer.c
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          rust/target
+        key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+        restore-keys: rust-${{ runner.os }}-
+
     - name: Build and install pg_textsearch
       run: |
         export PATH="$HOME/$PG_INSTALL_DIR/bin:$PATH"
@@ -491,6 +545,19 @@ jobs:
     - name: Install coverage tools
       run: |
         sudo apt-get install -y lcov build-essential bc
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          rust/target
+        key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+        restore-keys: rust-${{ runner.os }}-
 
     - name: Build extension with coverage instrumentation
       run: |
@@ -612,6 +679,34 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
         fi
 
+  rust-checks:
+    name: Rust Tests & Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          rust/target
+        key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+        restore-keys: rust-${{ runner.os }}-
+
+    - name: Run Rust tests
+      run: cd rust && cargo test
+
+    - name: Run Clippy
+      run: cd rust && cargo clippy -- -D warnings
+
   pgspot:
     name: Check Extension SQL
     runs-on: ubuntu-latest
@@ -645,7 +740,7 @@ jobs:
   # Umbrella job for branch protection rules
   all-tests-passed:
     runs-on: ubuntu-latest
-    needs: [test, build-test-multiple-configs, performance-test, format-check, sanitizer, coverage, pgspot]
+    needs: [test, build-test-multiple-configs, performance-test, format-check, sanitizer, coverage, rust-checks, pgspot]
     if: always()
     steps:
       - name: Check all jobs succeeded
