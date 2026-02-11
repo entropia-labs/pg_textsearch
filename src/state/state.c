@@ -28,6 +28,7 @@
 #include "constants.h"
 #include "memtable/posting.h"
 #include "memtable/stringtable.h"
+#include "memtable/tenant_stats.h"
 #include "segment/merge.h"
 #include "segment/segment.h"
 #include "state/metapage.h"
@@ -36,6 +37,20 @@
 
 /* Cache of local index states */
 static HTAB *local_state_cache = NULL;
+
+/*
+ * Backend-local accumulator for tenant stats during build mode.
+ * When the private DSA is destroyed on each spill, tenant stats
+ * in the dshash are lost. We accumulate them here so they survive.
+ */
+typedef struct TpLocalTenantStatsEntry
+{
+	uint32 tenant_id; /* Hash key */
+	uint32 doc_count;
+	int64  total_len;
+} TpLocalTenantStatsEntry;
+
+static HTAB *build_tenant_stats_accum = NULL;
 
 typedef struct LocalStateCacheEntry
 {
@@ -245,10 +260,11 @@ tp_create_shared_index_state(Oid index_oid, Oid heap_oid)
 		elog(ERROR, "Failed to allocate memtable in DSA");
 
 	memtable = (TpMemtable *)dsa_get_address(dsa, memtable_dp);
-	memtable->string_hash_handle = DSHASH_HANDLE_INVALID;
-	memtable->total_terms		 = 0;
-	memtable->total_postings	 = 0;
-	memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+	memtable->string_hash_handle  = DSHASH_HANDLE_INVALID;
+	memtable->total_terms		  = 0;
+	memtable->total_postings	  = 0;
+	memtable->doc_lengths_handle  = DSHASH_HANDLE_INVALID;
+	memtable->tenant_stats_handle = DSHASH_HANDLE_INVALID;
 
 	shared_state->memtable_dp = memtable_dp;
 
@@ -387,10 +403,11 @@ tp_create_build_index_state(Oid index_oid, Oid heap_oid)
 		elog(ERROR, "Failed to allocate memtable in private DSA");
 
 	memtable = (TpMemtable *)dsa_get_address(private_dsa, memtable_dp);
-	memtable->string_hash_handle = DSHASH_HANDLE_INVALID;
-	memtable->total_terms		 = 0;
-	memtable->total_postings	 = 0;
-	memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+	memtable->string_hash_handle  = DSHASH_HANDLE_INVALID;
+	memtable->total_terms		  = 0;
+	memtable->total_postings	  = 0;
+	memtable->doc_lengths_handle  = DSHASH_HANDLE_INVALID;
+	memtable->tenant_stats_handle = DSHASH_HANDLE_INVALID;
 
 	/* Store memtable pointer in shared state for memtable access */
 	shared_state->memtable_dp = memtable_dp;
@@ -464,10 +481,11 @@ tp_recreate_build_dsa(TpLocalIndexState *local_state)
 		elog(ERROR, "Failed to allocate memtable in new private DSA");
 
 	new_memtable = (TpMemtable *)dsa_get_address(new_dsa, memtable_dp);
-	new_memtable->string_hash_handle = DSHASH_HANDLE_INVALID;
-	new_memtable->total_terms		 = 0;
-	new_memtable->total_postings	 = 0;
-	new_memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+	new_memtable->string_hash_handle  = DSHASH_HANDLE_INVALID;
+	new_memtable->total_terms		  = 0;
+	new_memtable->total_postings	  = 0;
+	new_memtable->doc_lengths_handle  = DSHASH_HANDLE_INVALID;
+	new_memtable->tenant_stats_handle = DSHASH_HANDLE_INVALID;
 
 	/* Update shared state with new memtable pointer */
 	local_state->shared->memtable_dp = memtable_dp;
@@ -530,13 +548,66 @@ tp_finalize_build_mode(TpLocalIndexState *local_state)
 		elog(ERROR, "Failed to allocate memtable in global DSA");
 
 	memtable = (TpMemtable *)dsa_get_address(global_dsa, memtable_dp);
-	memtable->string_hash_handle = DSHASH_HANDLE_INVALID;
-	memtable->total_terms		 = 0;
-	memtable->total_postings	 = 0;
-	memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+	memtable->string_hash_handle  = DSHASH_HANDLE_INVALID;
+	memtable->total_terms		  = 0;
+	memtable->total_postings	  = 0;
+	memtable->doc_lengths_handle  = DSHASH_HANDLE_INVALID;
+	memtable->tenant_stats_handle = DSHASH_HANDLE_INVALID;
 
 	/* Update shared state with new memtable pointer */
 	local_state->shared->memtable_dp = memtable_dp;
+
+	/*
+	 * Restore accumulated tenant stats from build-time local hash
+	 * into the new global DSA dshash.
+	 */
+	if (build_tenant_stats_accum != NULL)
+	{
+		HASH_SEQ_STATUS			 seq;
+		TpLocalTenantStatsEntry *local_entry;
+
+		hash_seq_init(&seq, build_tenant_stats_accum);
+		while ((local_entry = (TpLocalTenantStatsEntry *)hash_seq_search(
+						&seq)) != NULL)
+		{
+			/*
+			 * Create the tenant stats dshash if needed
+			 * and insert each accumulated entry.
+			 */
+			if (memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
+			{
+				memtable->tenant_stats_handle = tp_tenant_stats_create(
+						global_dsa);
+			}
+
+			{
+				dshash_table	   *table;
+				TpTenantStatsEntry *entry;
+				bool				found;
+
+				table = tp_tenant_stats_attach(
+						global_dsa, memtable->tenant_stats_handle);
+				entry = (TpTenantStatsEntry *)dshash_find_or_insert(
+						table, &local_entry->tenant_id, &found);
+				if (!found)
+				{
+					entry->tenant_id = local_entry->tenant_id;
+					entry->doc_count = local_entry->doc_count;
+					entry->total_len = local_entry->total_len;
+				}
+				else
+				{
+					entry->doc_count += local_entry->doc_count;
+					entry->total_len += local_entry->total_len;
+				}
+				dshash_release_lock(table, entry);
+				dshash_detach(table);
+			}
+		}
+
+		hash_destroy(build_tenant_stats_accum);
+		build_tenant_stats_accum = NULL;
+	}
 
 	/* Transition to runtime mode */
 	local_state->is_build_mode = false;
@@ -617,6 +688,13 @@ tp_cleanup_build_mode_on_abort(void)
 		pfree(local_state);
 		entry->local_state = NULL;
 	}
+
+	/* Clean up build-time tenant stats accumulator */
+	if (build_tenant_stats_accum != NULL)
+	{
+		hash_destroy(build_tenant_stats_accum);
+		build_tenant_stats_accum = NULL;
+	}
 }
 
 /*
@@ -676,6 +754,17 @@ tp_cleanup_index_shared_memory(Oid index_oid)
 				tp_doclength_table_attach(dsa, memtable->doc_lengths_handle);
 		if (doc_lengths_hash != NULL)
 			dshash_destroy(doc_lengths_hash);
+	}
+
+	/* Destroy the tenant stats hash table if it exists */
+	if (memtable->tenant_stats_handle != DSHASH_HANDLE_INVALID)
+	{
+		dshash_table *tenant_stats;
+
+		tenant_stats =
+				tp_tenant_stats_attach(dsa, memtable->tenant_stats_handle);
+		if (tenant_stats != NULL)
+			dshash_destroy(tenant_stats);
 	}
 
 	/* Free shared state structures from DSA */
@@ -815,6 +904,13 @@ tp_rebuild_index_from_disk(Oid index_oid)
 		 */
 		local_state->shared->total_docs = metap->total_docs;
 		local_state->shared->total_len	= metap->total_len;
+
+		/* Restore per-tenant stats from disk */
+		if (metap->tenant_column_attno != 0 &&
+			metap->first_tenant_stats_page != InvalidBlockNumber)
+		{
+			tp_read_tenant_stats_pages(index_rel, local_state);
+		}
 
 		/* Recalculate IDF sum after recovery */
 		tp_calculate_idf_sum(local_state);
@@ -1174,10 +1270,65 @@ tp_clear_memtable(TpLocalIndexState *local_state)
 	/*
 	 * BUILD MODE: Destroy entire private DSA and create fresh one.
 	 * This provides perfect memory reclamation - ALL memory returns to OS.
+	 *
+	 * Before destroying, save tenant stats to a backend-local hash table
+	 * so they survive the DSA recreation.
 	 */
 	if (local_state->is_build_mode)
 	{
 		Size mem_before = dsa_get_total_size(local_state->dsa);
+
+		/* Save tenant stats before destroying DSA */
+		if (memtable->tenant_stats_handle != DSHASH_HANDLE_INVALID)
+		{
+			TpTenantStatsEntry *entries;
+			int					count;
+
+			count = tp_tenant_stats_collect(local_state, &entries);
+			if (count > 0)
+			{
+				/* Create local accumulator if it doesn't exist */
+				if (build_tenant_stats_accum == NULL)
+				{
+					HASHCTL ctl;
+
+					memset(&ctl, 0, sizeof(ctl));
+					ctl.keysize				 = sizeof(uint32);
+					ctl.entrysize			 = sizeof(TpLocalTenantStatsEntry);
+					ctl.hcxt				 = TopMemoryContext;
+					build_tenant_stats_accum = hash_create(
+							"Build Tenant Stats",
+							64,
+							&ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+				}
+
+				/* Accumulate into local hash */
+				for (int i = 0; i < count; i++)
+				{
+					TpLocalTenantStatsEntry *local_entry;
+					bool					 found;
+
+					local_entry = (TpLocalTenantStatsEntry *)hash_search(
+							build_tenant_stats_accum,
+							&entries[i].tenant_id,
+							HASH_ENTER,
+							&found);
+					if (!found)
+					{
+						local_entry->tenant_id = entries[i].tenant_id;
+						local_entry->doc_count = entries[i].doc_count;
+						local_entry->total_len = entries[i].total_len;
+					}
+					else
+					{
+						local_entry->doc_count += entries[i].doc_count;
+						local_entry->total_len += entries[i].total_len;
+					}
+				}
+				pfree(entries);
+			}
+		}
 
 		/* Destroy and recreate private DSA */
 		tp_recreate_build_dsa(local_state);

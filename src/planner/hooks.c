@@ -1004,7 +1004,7 @@ replace_scores_in_targetlist(List *targetlist, BM25OidCache *oids)
 	ListCell *lc;
 	Expr	 *orderby_expr = NULL;
 
-	/* First pass: find the resjunk ORDER BY expression */
+	/* First pass: find the ORDER BY expression (prefer resjunk) */
 	foreach (lc, targetlist)
 	{
 		TargetEntry *tle = (TargetEntry *)lfirst(lc);
@@ -1013,6 +1013,25 @@ replace_scores_in_targetlist(List *targetlist, BM25OidCache *oids)
 		{
 			orderby_expr = tle->expr;
 			break;
+		}
+	}
+
+	/*
+	 * Fallback: when ORDER BY matches a SELECT column, PostgreSQL
+	 * reuses the target list entry (no resjunk entry is created).
+	 * Look for any BM25 score expression in the target list.
+	 */
+	if (orderby_expr == NULL)
+	{
+		foreach (lc, targetlist)
+		{
+			TargetEntry *tle = (TargetEntry *)lfirst(lc);
+
+			if (is_bm25_score_opexpr((Node *)tle->expr, oids))
+			{
+				orderby_expr = tle->expr;
+				break;
+			}
 		}
 	}
 

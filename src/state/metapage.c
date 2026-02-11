@@ -21,6 +21,7 @@
 #include "memtable/memtable.h"
 #include "memtable/posting.h"
 #include "memtable/stringtable.h"
+#include "memtable/tenant_stats.h"
 #include "state/metapage.h"
 #include "state/state.h"
 #include "types/vector.h"
@@ -418,4 +419,203 @@ tp_clear_docid_pages(Relation index)
 
 	/* Invalidate the docid writer cache since pages are cleared */
 	docid_writer_cache.valid = false;
+}
+
+/*
+ * Tenant stats page header
+ */
+#define TP_TENANT_STATS_PAGE_MAGIC 0x54505453 /* "TPTS" */
+
+typedef struct TpTenantStatsPageHeader
+{
+	uint32		magic;		 /* TP_TENANT_STATS_PAGE_MAGIC */
+	uint32		num_entries; /* Number of entries on this page */
+	BlockNumber next_page;	 /* Next page in chain */
+} TpTenantStatsPageHeader;
+
+/* Entries per tenant stats page */
+#define TP_TENANT_STATS_PER_PAGE                   \
+	((BLCKSZ - sizeof(PageHeaderData) -            \
+	  MAXALIGN(sizeof(TpTenantStatsPageHeader))) / \
+	 sizeof(TpTenantStatsEntry))
+
+/*
+ * Write per-tenant statistics to disk as a page chain.
+ * Collects all entries from the dshash and writes them to
+ * pages linked from metap->first_tenant_stats_page.
+ */
+void
+tp_write_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
+{
+	TpTenantStatsEntry *entries;
+	int					count;
+	int					written	   = 0;
+	BlockNumber			first_page = InvalidBlockNumber;
+	BlockNumber			prev_page  = InvalidBlockNumber;
+	Buffer				prev_buf   = InvalidBuffer;
+
+	/* Collect all tenant stats from dshash */
+	count = tp_tenant_stats_collect(local_state, &entries);
+	if (count == 0)
+		return;
+
+	/* Write entries across pages */
+	while (written < count)
+	{
+		Buffer					 buf;
+		Page					 page;
+		TpTenantStatsPageHeader *header;
+		TpTenantStatsEntry		*page_entries;
+		int						 entries_this_page;
+
+		buf = ReadBuffer(index, P_NEW);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		PageInit(page, BLCKSZ, 0);
+
+		header			  = (TpTenantStatsPageHeader *)PageGetContents(page);
+		header->magic	  = TP_TENANT_STATS_PAGE_MAGIC;
+		header->next_page = InvalidBlockNumber;
+
+		page_entries = (TpTenantStatsEntry
+								*)((char *)header +
+								   MAXALIGN(sizeof(TpTenantStatsPageHeader)));
+
+		entries_this_page =
+				Min(count - written, (int)TP_TENANT_STATS_PER_PAGE);
+		memcpy(page_entries,
+			   &entries[written],
+			   entries_this_page * sizeof(TpTenantStatsEntry));
+		header->num_entries = entries_this_page;
+
+		MarkBufferDirty(buf);
+
+		if (first_page == InvalidBlockNumber)
+			first_page = BufferGetBlockNumber(buf);
+
+		/* Link previous page to this one */
+		if (prev_buf != InvalidBuffer)
+		{
+			Page					 pp = BufferGetPage(prev_buf);
+			TpTenantStatsPageHeader *ph = (TpTenantStatsPageHeader *)
+					PageGetContents(pp);
+			ph->next_page = BufferGetBlockNumber(buf);
+			MarkBufferDirty(prev_buf);
+			UnlockReleaseBuffer(prev_buf);
+		}
+
+		prev_buf  = buf;
+		prev_page = BufferGetBlockNumber(buf);
+		written += entries_this_page;
+	}
+
+	if (prev_buf != InvalidBuffer)
+		UnlockReleaseBuffer(prev_buf);
+
+	pfree(entries);
+
+	/* Update metapage with first tenant stats page */
+	{
+		Buffer			metabuf;
+		Page			metapage;
+		TpIndexMetaPage metap;
+
+		metabuf = ReadBuffer(index, TP_METAPAGE_BLKNO);
+		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+		metapage = BufferGetPage(metabuf);
+		metap	 = (TpIndexMetaPage)PageGetContents(metapage);
+
+		metap->first_tenant_stats_page = first_page;
+
+		MarkBufferDirty(metabuf);
+		FlushOneBuffer(metabuf);
+		UnlockReleaseBuffer(metabuf);
+	}
+
+	(void)prev_page;
+}
+
+/*
+ * Read per-tenant statistics from disk and restore into
+ * the dshash table in shared memory.
+ */
+void
+tp_read_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
+{
+	TpIndexMetaPage metap;
+	BlockNumber		current_page;
+
+	metap = tp_get_metapage(index);
+	if (!metap)
+		return;
+
+	current_page = metap->first_tenant_stats_page;
+	pfree(metap);
+
+	while (current_page != InvalidBlockNumber)
+	{
+		Buffer					 buf;
+		Page					 page;
+		TpTenantStatsPageHeader *header;
+		TpTenantStatsEntry		*page_entries;
+		uint32					 i;
+
+		buf = ReadBuffer(index, current_page);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		header = (TpTenantStatsPageHeader *)PageGetContents(page);
+		if (header->magic != TP_TENANT_STATS_PAGE_MAGIC)
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+
+		page_entries = (TpTenantStatsEntry
+								*)((char *)header +
+								   MAXALIGN(sizeof(TpTenantStatsPageHeader)));
+
+		for (i = 0; i < header->num_entries; i++)
+		{
+			TpTenantStatsEntry *e = &page_entries[i];
+			TpMemtable		   *memtable;
+			dshash_table	   *table;
+			TpTenantStatsEntry *dst;
+			bool				found;
+
+			memtable = get_memtable(local_state);
+			if (!memtable)
+				break;
+
+			if (memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
+			{
+				memtable->tenant_stats_handle = tp_tenant_stats_create(
+						local_state->dsa);
+			}
+
+			table = tp_tenant_stats_attach(
+					local_state->dsa, memtable->tenant_stats_handle);
+			if (!table)
+				break;
+
+			dst = (TpTenantStatsEntry *)
+					dshash_find_or_insert(table, &e->tenant_id, &found);
+			if (!found)
+			{
+				dst->tenant_id = e->tenant_id;
+				dst->doc_count = e->doc_count;
+				dst->total_len = e->total_len;
+			}
+			else
+			{
+				dst->doc_count += e->doc_count;
+				dst->total_len += e->total_len;
+			}
+			dshash_release_lock(table, dst);
+			dshash_detach(table);
+		}
+
+		current_page = header->next_page;
+		UnlockReleaseBuffer(buf);
+	}
 }

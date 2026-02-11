@@ -43,6 +43,10 @@ typedef struct TpMemtable
 	/* Document length hash table in DSA */
 	dshash_table_handle doc_lengths_handle; /* Handle for document length hash
 											 * table */
+
+	/* Per-tenant corpus statistics in DSA */
+	dshash_table_handle tenant_stats_handle; /* Handle for tenant stats hash
+											  * table */
 } TpMemtable;
 
 /*

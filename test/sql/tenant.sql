@@ -153,53 +153,50 @@ ORDER BY content <@> 'server'::bm25query, id LIMIT 10;
 DROP TABLE tenant_shared CASCADE;
 
 -- ============================================================
--- SECTION 2d: BM25 scores use global stats (not per-tenant)
+-- SECTION 2d: Per-tenant BM25 statistics affect scoring
 -- ============================================================
--- Verify that BM25 scores are identical whether or not a tenant
--- filter is applied, because avg_doc_length and total_docs are
--- global across all tenants. This documents current behavior.
+-- Proves per-tenant stats (avgdl, total_docs, doc_freq) are used
+-- by showing the SAME document gets a DIFFERENT score with vs
+-- without a tenant filter.
 
-CREATE TABLE tenant_scores (
+CREATE TABLE tenant_scoring (
     id SERIAL PRIMARY KEY,
     content TEXT,
     tenant_id INTEGER NOT NULL
 );
 
-CREATE INDEX tenant_scores_idx ON tenant_scores USING bm25(content)
+CREATE INDEX tenant_scoring_idx ON tenant_scoring USING bm25(content)
     WITH (text_config='english', tenant_column='tenant_id');
 
--- Tenant 1: short docs (2 terms each)
-INSERT INTO tenant_scores (content, tenant_id) VALUES
-    ('quick fox', 1),
-    ('quick dog', 1);
+-- Tenant 1: 3 short docs, 2 containing "search"
+INSERT INTO tenant_scoring (content, tenant_id) VALUES
+    ('search engine', 1),
+    ('search results', 1),
+    ('web browser', 1);
 
--- Tenant 2: long docs (many terms each) — these inflate avg_doc_length
-INSERT INTO tenant_scores (content, tenant_id) VALUES
-    ('quick brown fox jumps over the lazy dog in the park near the river', 2),
-    ('quick red fox runs across the wide open field under the bright sun', 2);
+-- Tenant 2: 100 long docs, none containing "search"
+-- This skews global avgdl high and makes "search" globally rare
+INSERT INTO tenant_scoring (content, tenant_id)
+SELECT 'alpha beta gamma delta epsilon zeta eta theta iota'
+    || ' kappa lambda mu document ' || i, 2
+FROM generate_series(1, 100) i;
 
--- Score for tenant 1 with filter: uses global avg_doc_length
-SELECT id, tenant_id,
-       content <@> 'quick'::bm25query as score
-FROM tenant_scores
-WHERE content <@> 'quick'::bm25query < 0 AND tenant_id = 1
-ORDER BY content <@> 'quick'::bm25query, id;
+-- Score WITH tenant filter (per-tenant stats: avgdl=2, N=3, df=2)
+-- "search" appears in 2/3 tenant-1 docs → low IDF → small score
+SELECT id, content <@> 'search'::bm25query as score
+FROM tenant_scoring
+WHERE content <@> 'search'::bm25query < 0 AND tenant_id = 1
+ORDER BY content <@> 'search'::bm25query, id;
 
--- Score for tenant 2 with filter: uses same global avg_doc_length
-SELECT id, tenant_id,
-       content <@> 'quick'::bm25query as score
-FROM tenant_scores
-WHERE content <@> 'quick'::bm25query < 0 AND tenant_id = 2
-ORDER BY content <@> 'quick'::bm25query, id;
+-- Score WITHOUT tenant filter (global stats: avgdl≈13, N=103, df=2)
+-- "search" appears in 2/103 global docs → high IDF → large score
+-- Same doc id=1 must have a DIFFERENT (more negative) score here
+SELECT id, content <@> 'search'::bm25query as score
+FROM tenant_scoring
+WHERE content <@> 'search'::bm25query < 0
+ORDER BY content <@> 'search'::bm25query, id;
 
--- Score without any tenant filter: all 4 rows, same scores as above
-SELECT id, tenant_id,
-       content <@> 'quick'::bm25query as score
-FROM tenant_scores
-WHERE content <@> 'quick'::bm25query < 0
-ORDER BY content <@> 'quick'::bm25query, id;
-
-DROP TABLE tenant_scores CASCADE;
+DROP TABLE tenant_scoring CASCADE;
 
 -- ============================================================
 -- SECTION 3: Tenant-enabled index with segment spill

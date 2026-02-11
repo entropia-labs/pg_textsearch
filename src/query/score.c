@@ -13,8 +13,10 @@
 #include <utils/memutils.h>
 
 #include "memtable/memtable.h"
+#include "memtable/posting.h"
 #include "memtable/source.h"
 #include "memtable/stringtable.h"
+#include "memtable/tenant_stats.h"
 #include "query/bmw.h"
 #include "query/score.h"
 #include "segment/segment.h"
@@ -358,6 +360,98 @@ tp_batch_get_unified_doc_freq(
 }
 
 /*
+ * Get per-tenant doc_freq for a single term.
+ * For memtable: iterates postings and counts matching tenant_id.
+ * For segments: uses global doc_freq as fallback (V4 sections TBD).
+ */
+static uint32
+tp_get_tenant_doc_freq(
+		TpLocalIndexState *local_state,
+		Relation		   index,
+		const char		  *term,
+		BlockNumber		  *level_heads,
+		uint32			   tenant_id)
+{
+	uint32		   doc_freq = 0;
+	TpPostingList *posting_list;
+	int			   level;
+
+	/* Count memtable postings matching tenant_id */
+	posting_list = tp_get_posting_list(local_state, term);
+	if (posting_list && posting_list->doc_count > 0)
+	{
+		TpPostingEntry *entries =
+				tp_get_posting_entries(local_state->dsa, posting_list);
+		for (int i = 0; i < posting_list->doc_count; i++)
+		{
+			if (entries[i].tenant_id == tenant_id)
+				doc_freq++;
+		}
+	}
+
+	/*
+	 * For segments: use global doc_freq as approximation.
+	 * V4 segments with tenant_docfreq sections will provide
+	 * exact per-tenant counts in the future.
+	 */
+	for (level = 0; level < TP_MAX_LEVELS; level++)
+	{
+		if (level_heads[level] != InvalidBlockNumber)
+		{
+			doc_freq +=
+					tp_segment_get_doc_freq(index, level_heads[level], term);
+		}
+	}
+
+	return doc_freq;
+}
+
+/*
+ * Batch get per-tenant doc_freq for multiple terms.
+ */
+static void
+tp_batch_get_tenant_doc_freq(
+		TpLocalIndexState *local_state,
+		Relation		   index,
+		char			 **terms,
+		int				   term_count,
+		BlockNumber		  *level_heads,
+		uint32			  *doc_freqs,
+		uint32			   tenant_id)
+{
+	int level;
+
+	/* Initialize with memtable per-tenant counts */
+	for (int i = 0; i < term_count; i++)
+	{
+		TpPostingList *posting_list =
+				tp_get_posting_list(local_state, terms[i]);
+		doc_freqs[i] = 0;
+
+		if (posting_list && posting_list->doc_count > 0)
+		{
+			TpPostingEntry *entries =
+					tp_get_posting_entries(local_state->dsa, posting_list);
+			for (int j = 0; j < posting_list->doc_count; j++)
+			{
+				if (entries[j].tenant_id == tenant_id)
+					doc_freqs[i]++;
+			}
+		}
+	}
+
+	/* Add segment doc_freq (global fallback) */
+	for (level = 0; level < TP_MAX_LEVELS; level++)
+	{
+		if (level_heads[level] != InvalidBlockNumber)
+		{
+			tp_batch_get_segment_doc_freq(
+					index, level_heads[level], terms, term_count, doc_freqs);
+		}
+	}
+}
+
+/*
  * Copy results to output arrays
  */
 static void
@@ -452,6 +546,26 @@ tp_score_documents(
 		level_heads[i] = metap->level_heads[i];
 	pfree(metap);
 
+	/*
+	 * Per-tenant statistics override: when a tenant filter is active,
+	 * use per-tenant avgdl and total_docs for accurate BM25 scoring.
+	 */
+	if (tenant_id != 0)
+	{
+		uint32 t_docs;
+		int64  t_len;
+
+		if (tp_get_tenant_stats(local_state, tenant_id, &t_docs, &t_len))
+		{
+			if (t_docs > 0)
+			{
+				total_docs	= t_docs;
+				avg_doc_len = (float4)(t_len / (double)t_docs);
+			}
+		}
+		/* If tenant not found, fall back to global stats */
+	}
+
 	/* If avg_doc_len is 0, all documents have zero length and
 	 * would get zero BM25 scores */
 	if (avg_doc_len <= 0.0f)
@@ -470,9 +584,13 @@ tp_score_documents(
 		int			result_count;
 		TpBMWStats	stats;
 
-		/* Get unified doc_freq across memtable and segments */
-		doc_freq = tp_get_unified_doc_freq(
-				local_state, index_relation, term, level_heads);
+		/* Get doc_freq: per-tenant or global */
+		if (tenant_id != 0)
+			doc_freq = tp_get_tenant_doc_freq(
+					local_state, index_relation, term, level_heads, tenant_id);
+		else
+			doc_freq = tp_get_unified_doc_freq(
+					local_state, index_relation, term, level_heads);
 		if (doc_freq == 0)
 			return 0;
 
@@ -534,15 +652,25 @@ tp_score_documents(
 		int		   i;
 		TpBMWStats stats;
 
-		/* Batch lookup doc_freqs for all terms (opens each segment once) */
+		/* Batch lookup doc_freqs: per-tenant or global */
 		doc_freqs = palloc(query_term_count * sizeof(uint32));
-		tp_batch_get_unified_doc_freq(
-				local_state,
-				index_relation,
-				query_terms,
-				query_term_count,
-				level_heads,
-				doc_freqs);
+		if (tenant_id != 0)
+			tp_batch_get_tenant_doc_freq(
+					local_state,
+					index_relation,
+					query_terms,
+					query_term_count,
+					level_heads,
+					doc_freqs,
+					tenant_id);
+		else
+			tp_batch_get_unified_doc_freq(
+					local_state,
+					index_relation,
+					query_terms,
+					query_term_count,
+					level_heads,
+					doc_freqs);
 
 		/* Convert doc_freqs to IDFs */
 		idfs = palloc(query_term_count * sizeof(float4));

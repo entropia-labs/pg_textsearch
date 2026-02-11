@@ -24,6 +24,7 @@
 #include "memtable/memtable.h"
 #include "memtable/posting.h"
 #include "memtable/stringtable.h"
+#include "memtable/tenant_stats.h"
 #include "planner/hooks.h"
 #include "query/score.h"
 #include "state/registry.h"
@@ -276,6 +277,7 @@ _PG_init(void)
 	LWLockRegisterTranche(TP_STRING_HASH_TRANCHE_ID, "tapir_string_hash");
 	LWLockRegisterTranche(
 			TP_DOCLENGTH_HASH_TRANCHE_ID, "tapir_doclength_hash");
+	LWLockRegisterTranche(TP_TRANCHE_TENANT_STATS, "tapir_tenant_stats");
 }
 
 /*

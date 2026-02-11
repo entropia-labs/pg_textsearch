@@ -20,6 +20,7 @@
 #include "posting.h"
 #include "state/state.h"
 #include "stringtable.h"
+#include "tenant_stats.h"
 
 /*
  * Get string length from key.
@@ -503,6 +504,10 @@ tp_add_document_terms(
 	 */
 	local_state->shared->total_docs++;
 	local_state->shared->total_len += doc_length;
+
+	/* Update per-tenant statistics if tenant filtering is active */
+	if (tenant_id != 0)
+		tp_update_tenant_stats(local_state, tenant_id, doc_length);
 
 	/* Track terms added in this transaction for bulk load detection */
 	local_state->terms_added_this_xact += term_count;

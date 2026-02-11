@@ -30,6 +30,7 @@
 #include "memtable/memtable.h"
 #include "memtable/posting.h"
 #include "memtable/stringtable.h"
+#include "memtable/tenant_stats.h"
 #include "segment/merge.h"
 #include "segment/segment.h"
 #include "state/metapage.h"
@@ -427,12 +428,19 @@ tp_build_finalize_and_update_stats(
 	metap->total_docs = *total_docs;
 	metap->total_len  = *total_len;
 
-	MarkBufferDirty(metabuf);
+	{
+		uint32 tenant_attno = metap->tenant_column_attno;
 
-	/* Flush metapage to disk immediately to ensure crash recovery works */
-	FlushOneBuffer(metabuf);
+		MarkBufferDirty(metabuf);
 
-	UnlockReleaseBuffer(metabuf);
+		/* Flush metapage to disk for crash recovery */
+		FlushOneBuffer(metabuf);
+		UnlockReleaseBuffer(metabuf);
+
+		/* Write per-tenant stats to disk if tenant column is set */
+		if (tenant_attno != 0)
+			tp_write_tenant_stats_pages(index, index_state);
+	}
 }
 
 /*
@@ -708,6 +716,7 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	uint64			   total_docs = 0;
 	uint64			   total_len  = 0;
 	TpLocalIndexState *index_state;
+	AttrNumber		   tenant_attnum = InvalidAttrNumber;
 
 	/* BM25 index build started */
 	elog(NOTICE,
@@ -756,7 +765,6 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * The tenant_column reloption stores the column name; we resolve it
 	 * to an attnum and store in the metapage for use at query time.
 	 */
-	AttrNumber tenant_attnum = InvalidAttrNumber;
 	{
 		TpOptions *options = (TpOptions *)index->rd_options;
 		if (options && options->tenant_column_offset > 0)
