@@ -50,10 +50,15 @@ OBJS = \
 MODULE_big = pg_textsearch
 
 # Include directories, debug flags, and warning flags for unused code
-PG_CPPFLAGS = -I$(srcdir)/src -g -O2 -Wall -Wextra -Wunused-function -Wunused-variable -Wunused-parameter -Wunused-but-set-variable
+PG_CPPFLAGS = -I$(srcdir)/src -I$(srcdir)/rust/include -g -O2 -Wall -Wextra -Wunused-function -Wunused-variable -Wunused-parameter -Wunused-but-set-variable
 
 # Uncomment the following line to enable debug index dumps
 # PG_CPPFLAGS += -DDEBUG_DUMP_INDEX
+
+# Rust static library
+RUST_SRCDIR = $(srcdir)/rust
+RUST_STATICLIB = $(RUST_SRCDIR)/target/release/libpg_textsearch_rust.a
+SHLIB_LINK += $(RUST_STATICLIB)
 
 # Test configuration
 REGRESS = aerodocs basic binary_io bmw compression concurrent_build coverage deletion vacuum dropped empty implicit index inheritance limits lock manyterms memory merge mixed parallel_build partitioned partitioned_many queries rescan schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security segment segment_integrity strings unsupported updates vector unlogged_index wand text_config
@@ -62,6 +67,18 @@ REGRESS_OPTS = --inputdir=test --outputdir=test
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Rust build targets
+RUST_SOURCES = $(wildcard $(RUST_SRCDIR)/src/*.rs $(RUST_SRCDIR)/src/**/*.rs)
+
+$(RUST_STATICLIB): $(RUST_SOURCES) $(RUST_SRCDIR)/Cargo.toml
+	cd $(RUST_SRCDIR) && cargo build --release
+
+rust-test:
+	cd $(RUST_SRCDIR) && cargo test
+
+rust-clean:
+	cd $(RUST_SRCDIR) && cargo clean
 
 # SQL regression tests
 test:
@@ -84,8 +101,8 @@ test-local: install
 	@pg_ctl stop -D tmp_check_shared/data -l tmp_check_shared/data/logfile
 	@rm -rf tmp_check_shared
 
-# Clean test directories
-clean: clean-test-dirs
+# Clean test directories and Rust build
+clean: clean-test-dirs rust-clean
 
 clean-test-dirs:
 	@rm -rf tmp_check_shared coverage-html coverage.info
@@ -204,7 +221,7 @@ endif
 		exit 1; \
 	fi
 	$(MAKE) clean
-	$(MAKE) PG_CFLAGS="--coverage -O0 -g" SHLIB_LINK="--coverage"
+	$(MAKE) PG_CFLAGS="--coverage -O0 -g" SHLIB_LINK="--coverage $(RUST_STATICLIB)"
 	$(MAKE) install
 
 coverage: coverage-build
@@ -292,4 +309,4 @@ help:
 	@echo "  make test-all"
 	@echo "  make format"
 
-.PHONY: test clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help
+.PHONY: test clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help rust-test rust-clean

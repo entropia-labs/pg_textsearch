@@ -39,7 +39,10 @@ Thumbs.db
 
 # VSCode files
 compile_commands.json
-target/
+
+# Rust build artifacts
+rust/target/
+rust/include/pg_textsearch_rust.h
 __pycache__/
 *.pyc
 PR_BREAKDOWN.md
