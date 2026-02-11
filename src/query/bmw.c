@@ -355,21 +355,27 @@ tp_topk_extract(TpTopKHeap *heap, ItemPointerData *ctids, float4 *scores)
 /*
  * ------------------------------------------------------------
  * Block Max Score Computation
+ * (Delegates to Rust implementation in rust/src/scoring.rs)
  * ------------------------------------------------------------
  */
+
+/* Rust FFI declarations */
+extern float4 tp_rust_block_max_score(
+		uint16 max_tf,
+		uint8  max_norm,
+		float4 idf,
+		float4 k1,
+		float4 b,
+		float4 avgdl);
+extern float4 tp_rust_bm25_score(
+		float4 idf, int32 tf, int32 dl, float4 k1, float4 b, float4 avgdl);
 
 float4
 tp_compute_block_max_score(
 		TpSkipEntry *skip, float4 idf, float4 k1, float4 b, float4 avg_doc_len)
 {
-	float4 tf = (float4)skip->block_max_tf;
-	float4 dl = (float4)decode_fieldnorm(skip->block_max_norm);
-
-	/* BM25 formula with max TF and min doc length in block */
-	float4 len_norm		= 1.0f - b + b * (dl / avg_doc_len);
-	float4 tf_component = (tf * (k1 + 1.0f)) / (tf + k1 * len_norm);
-
-	return idf * tf_component;
+	return tp_rust_block_max_score(
+			skip->block_max_tf, skip->block_max_norm, idf, k1, b, avg_doc_len);
 }
 
 /*
@@ -384,11 +390,7 @@ compute_bm25_score(
 		float4 b,
 		float4 avg_doc_len)
 {
-	float4 len_norm		= 1.0f - b + b * ((float4)doc_len / avg_doc_len);
-	float4 tf_component = ((float4)tf * (k1 + 1.0f)) /
-						  ((float4)tf + k1 * len_norm);
-
-	return idf * tf_component;
+	return tp_rust_bm25_score(idf, tf, doc_len, k1, b, avg_doc_len);
 }
 
 /*

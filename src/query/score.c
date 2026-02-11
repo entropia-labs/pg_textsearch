@@ -22,19 +22,18 @@
 #include "state/metapage.h"
 #include "state/state.h"
 
+/* Rust FFI declaration (implemented in rust/src/scoring.rs) */
+extern float4 tp_rust_calculate_idf(int32 doc_freq, int32 total_docs);
+
 /*
  * Centralized IDF calculation (basic version)
  * Calculates IDF using BM25 formula: log(1 + (N - df + 0.5) / (df + 0.5))
- * This formula ensures IDF is always non-negative since log(1 + x) >= 0
- * for all x >= 0.
+ * Delegates to Rust implementation.
  */
 float4
 tp_calculate_idf(int32 doc_freq, int32 total_docs)
 {
-	double idf_numerator   = (double)(total_docs - doc_freq + 0.5);
-	double idf_denominator = (double)(doc_freq + 0.5);
-	double idf_ratio	   = idf_numerator / idf_denominator;
-	return (float4)log(1.0 + idf_ratio);
+	return tp_rust_calculate_idf(doc_freq, total_docs);
 }
 
 /*
