@@ -265,6 +265,122 @@ ORDER BY score LIMIT 10;
 DROP TABLE tenant_none CASCADE;
 
 -- ============================================================
+-- SECTION 5: Parallel build preserves per-tenant stats
+-- ============================================================
+-- Verifies that parallel index build correctly tracks per-tenant
+-- doc_count/total_len across worker buffers.
+
+SET max_parallel_maintenance_workers = 2;
+
+CREATE TABLE tenant_parallel (
+    id SERIAL PRIMARY KEY,
+    content TEXT,
+    tenant_id INTEGER NOT NULL
+);
+
+-- Insert 100K rows across 5 tenants with varying term distributions
+-- Tenant 1: "alpha" heavy (every doc)
+-- Tenant 2: "beta" heavy (every doc)
+-- Other tenants: mixed terms
+INSERT INTO tenant_parallel (content, tenant_id)
+SELECT
+    CASE ((i - 1) % 5) + 1
+        WHEN 1 THEN 'alpha keyword document ' || i
+        WHEN 2 THEN 'beta keyword document ' || i
+        WHEN 3 THEN 'gamma delta document ' || i
+        WHEN 4 THEN 'alpha beta gamma document ' || i
+        WHEN 5 THEN 'delta epsilon document ' || i
+    END,
+    ((i - 1) % 5) + 1
+FROM generate_series(1, 100000) i;
+
+ANALYZE tenant_parallel;
+
+CREATE INDEX tenant_parallel_idx ON tenant_parallel USING bm25(content)
+    WITH (text_config='english', tenant_column='tenant_id');
+
+-- Verify basic querying works after parallel build
+SELECT COUNT(*) AS alpha_hits FROM tenant_parallel
+WHERE content <@> to_bm25query('alpha', 'tenant_parallel_idx') < 0;
+
+-- Verify tenant filtering works after parallel build
+SELECT COUNT(*) AS alpha_t1 FROM tenant_parallel
+WHERE content <@> to_bm25query('alpha', 'tenant_parallel_idx') < 0
+    AND tenant_id = 1;
+
+SELECT COUNT(*) AS alpha_t4 FROM tenant_parallel
+WHERE content <@> to_bm25query('alpha', 'tenant_parallel_idx') < 0
+    AND tenant_id = 4;
+
+-- Per-tenant scores differ from global scores.
+-- "keyword" is in every tenant-1 doc, so per-tenant IDF is low.
+-- Globally "keyword" appears in 2/5 of tenants, so global IDF is
+-- higher.  The two queries below show different score magnitudes
+-- for the SAME document (id=1), proving per-tenant stats are used.
+SELECT id, content <@> 'keyword'::bm25query AS score
+FROM tenant_parallel
+WHERE content <@> 'keyword'::bm25query < 0
+ORDER BY content <@> 'keyword'::bm25query, id
+LIMIT 3;
+
+SELECT id, content <@> 'keyword'::bm25query AS score
+FROM tenant_parallel
+WHERE content <@> 'keyword'::bm25query < 0 AND tenant_id = 1
+ORDER BY content <@> 'keyword'::bm25query, id
+LIMIT 3;
+
+DROP TABLE tenant_parallel CASCADE;
+RESET max_parallel_maintenance_workers;
+
+-- ============================================================
+-- SECTION 6: Segment spill with per-tenant doc_freq (V4)
+-- ============================================================
+-- After spilling to a segment, per-tenant doc_freq from the V4
+-- tenant_docfreq section should be used for scoring, yielding
+-- different scores than global doc_freq.
+
+CREATE TABLE tenant_spill (
+    id SERIAL PRIMARY KEY,
+    content TEXT,
+    tenant_id INTEGER NOT NULL
+);
+
+CREATE INDEX tenant_spill_idx ON tenant_spill USING bm25(content)
+    WITH (text_config='english', tenant_column='tenant_id');
+
+-- Tenant 1: 3 short docs with "search"
+INSERT INTO tenant_spill (content, tenant_id) VALUES
+    ('search engine optimization', 1),
+    ('search engine ranking', 1),
+    ('web development basics', 1);
+
+-- Tenant 2: 50 docs, none containing "search"
+INSERT INTO tenant_spill (content, tenant_id)
+SELECT 'alpha beta gamma delta epsilon zeta eta theta iota'
+    || ' kappa lambda mu nu document ' || i, 2
+FROM generate_series(1, 50) i;
+
+-- Force memtable spill to segment
+SELECT bm25_spill_index('tenant_spill_idx') IS NOT NULL AS spilled;
+
+-- After spill, all data is in segments.
+-- Per-tenant scoring for tenant 1 should use tenant-1 doc_freq.
+
+-- Score WITH tenant filter (per-tenant: df=2 out of N=3)
+SELECT id, content <@> 'search'::bm25query AS score
+FROM tenant_spill
+WHERE content <@> 'search'::bm25query < 0 AND tenant_id = 1
+ORDER BY content <@> 'search'::bm25query, id;
+
+-- Score WITHOUT tenant filter (global: df=2 out of N=53)
+SELECT id, content <@> 'search'::bm25query AS score
+FROM tenant_spill
+WHERE content <@> 'search'::bm25query < 0
+ORDER BY content <@> 'search'::bm25query, id;
+
+DROP TABLE tenant_spill CASCADE;
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
 DROP EXTENSION pg_textsearch CASCADE;

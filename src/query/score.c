@@ -389,17 +389,18 @@ tp_get_tenant_doc_freq(
 		}
 	}
 
-	/*
-	 * For segments: use global doc_freq as approximation.
-	 * V4 segments with tenant_docfreq sections will provide
-	 * exact per-tenant counts in the future.
-	 */
+	/* Add per-tenant doc_freq from V4 segments (falls back to global) */
 	for (level = 0; level < TP_MAX_LEVELS; level++)
 	{
 		if (level_heads[level] != InvalidBlockNumber)
 		{
-			doc_freq +=
-					tp_segment_get_doc_freq(index, level_heads[level], term);
+			uint32 seg_df = tp_segment_get_tenant_doc_freq(
+					index, level_heads[level], term, tenant_id);
+			if (seg_df > 0)
+				doc_freq += seg_df;
+			else
+				doc_freq += tp_segment_get_doc_freq(
+						index, level_heads[level], term);
 		}
 	}
 
@@ -440,13 +441,18 @@ tp_batch_get_tenant_doc_freq(
 		}
 	}
 
-	/* Add segment doc_freq (global fallback) */
+	/* Add per-tenant segment doc_freq (with V3 global fallback) */
 	for (level = 0; level < TP_MAX_LEVELS; level++)
 	{
 		if (level_heads[level] != InvalidBlockNumber)
 		{
-			tp_batch_get_segment_doc_freq(
-					index, level_heads[level], terms, term_count, doc_freqs);
+			tp_batch_get_segment_tenant_doc_freq(
+					index,
+					level_heads[level],
+					terms,
+					term_count,
+					doc_freqs,
+					tenant_id);
 		}
 	}
 }

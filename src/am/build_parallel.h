@@ -56,8 +56,9 @@ typedef struct TpWorkerMemtableBuffer
 	pg_atomic_uint32 status; /* TpWorkerBufferStatus */
 
 	/* Memtable data (stored in shared DSA) */
-	dshash_table_handle string_hash_handle; /* Term -> posting list */
-	dshash_table_handle doc_lengths_handle; /* CTID -> doc length */
+	dshash_table_handle string_hash_handle;	 /* Term -> posting list */
+	dshash_table_handle doc_lengths_handle;	 /* CTID -> doc length */
+	dshash_table_handle tenant_stats_handle; /* tenant_id -> stats */
 
 	/* Statistics for this buffer */
 	int32 num_docs;		  /* Documents in this buffer */

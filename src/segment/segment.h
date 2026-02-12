@@ -471,3 +471,19 @@ extern bool tp_segment_posting_iterator_seek(
 /* Get current doc ID from iterator (for WAND pivot selection) */
 extern uint32
 tp_segment_posting_iterator_current_doc_id(TpSegmentPostingIterator *iter);
+
+/* Per-tenant doc_freq lookup from V4 segments */
+extern uint32 tp_segment_get_tenant_doc_freq(
+		Relation	index,
+		BlockNumber first_segment,
+		const char *term,
+		uint32		tenant_id);
+
+/* Batch per-tenant doc_freq lookup for multiple terms */
+extern void tp_batch_get_segment_tenant_doc_freq(
+		Relation	index,
+		BlockNumber first_segment,
+		char	  **terms,
+		int			term_count,
+		uint32	   *doc_freqs,
+		uint32		tenant_id);

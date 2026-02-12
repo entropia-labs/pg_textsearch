@@ -440,22 +440,19 @@ typedef struct TpTenantStatsPageHeader
 	 sizeof(TpTenantStatsEntry))
 
 /*
- * Write per-tenant statistics to disk as a page chain.
- * Collects all entries from the dshash and writes them to
- * pages linked from metap->first_tenant_stats_page.
+ * Write per-tenant statistics to disk from a pre-built array.
+ * Writes entries as a page chain linked from
+ * metap->first_tenant_stats_page.
  */
 void
-tp_write_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
+tp_write_tenant_stats_pages_from_array(
+		Relation index, TpTenantStatsEntry *entries, int count)
 {
-	TpTenantStatsEntry *entries;
-	int					count;
-	int					written	   = 0;
-	BlockNumber			first_page = InvalidBlockNumber;
-	BlockNumber			prev_page  = InvalidBlockNumber;
-	Buffer				prev_buf   = InvalidBuffer;
+	int			written	   = 0;
+	BlockNumber first_page = InvalidBlockNumber;
+	BlockNumber prev_page  = InvalidBlockNumber;
+	Buffer		prev_buf   = InvalidBuffer;
 
-	/* Collect all tenant stats from dshash */
-	count = tp_tenant_stats_collect(local_state, &entries);
 	if (count == 0)
 		return;
 
@@ -512,8 +509,6 @@ tp_write_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
 	if (prev_buf != InvalidBuffer)
 		UnlockReleaseBuffer(prev_buf);
 
-	pfree(entries);
-
 	/* Update metapage with first tenant stats page */
 	{
 		Buffer			metabuf;
@@ -533,6 +528,26 @@ tp_write_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
 	}
 
 	(void)prev_page;
+}
+
+/*
+ * Write per-tenant statistics to disk as a page chain.
+ * Collects all entries from the dshash and writes them to
+ * pages linked from metap->first_tenant_stats_page.
+ */
+void
+tp_write_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
+{
+	TpTenantStatsEntry *entries;
+	int					count;
+
+	/* Collect all tenant stats from dshash */
+	count = tp_tenant_stats_collect(local_state, &entries);
+	if (count == 0)
+		return;
+
+	tp_write_tenant_stats_pages_from_array(index, entries, count);
+	pfree(entries);
 }
 
 /*

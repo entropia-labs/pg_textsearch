@@ -944,3 +944,320 @@ tp_score_all_terms_in_segment_chain(
 		tp_segment_close(reader);
 	}
 }
+
+/*
+ * Look up per-tenant doc_freq for a single term across a segment
+ * chain. Returns the per-tenant doc_freq from V4 tenant_docfreq
+ * sections. Falls back to 0 for V3 segments or terms not found.
+ */
+uint32
+tp_segment_get_tenant_doc_freq(
+		Relation	index,
+		BlockNumber first_segment,
+		const char *term,
+		uint32		tenant_id)
+{
+	BlockNumber current	 = first_segment;
+	uint32		doc_freq = 0;
+
+	while (current != InvalidBlockNumber)
+	{
+		TpSegmentReader *reader;
+		TpSegmentHeader *header;
+
+		reader = tp_segment_open(index, current);
+		if (!reader)
+			break;
+
+		header = reader->header;
+
+		if (header->num_terms > 0 &&
+			(header->flags & TP_FLAG_HAS_TENANT_DATA) &&
+			header->tenant_docfreq_offset != 0)
+		{
+			TpDictionary dict_header;
+			uint32		*string_offsets;
+			int			 left, right;
+
+			tp_segment_read(
+					reader,
+					header->dictionary_offset,
+					&dict_header,
+					sizeof(dict_header.num_terms));
+
+			string_offsets = palloc(dict_header.num_terms * sizeof(uint32));
+			tp_segment_read(
+					reader,
+					header->dictionary_offset + sizeof(dict_header.num_terms),
+					string_offsets,
+					dict_header.num_terms * sizeof(uint32));
+
+			left  = 0;
+			right = (int)dict_header.num_terms - 1;
+
+			while (left <= right)
+			{
+				int	   mid	   = left + (right - left) / 2;
+				uint32 str_off = header->strings_offset + string_offsets[mid];
+				uint32 str_len;
+				char  *buf;
+				int	   cmp;
+
+				tp_segment_read(reader, str_off, &str_len, sizeof(uint32));
+				buf = palloc(str_len + 1);
+				tp_segment_read(
+						reader, str_off + sizeof(uint32), buf, str_len);
+				buf[str_len] = '\0';
+				cmp			 = strcmp(term, buf);
+				pfree(buf);
+
+				if (cmp == 0)
+				{
+					/* Found term at index `mid` */
+					uint32 term_off_val;
+					uint32 data_off;
+					uint32 num_tenants;
+
+					tp_segment_read(
+							reader,
+							header->tenant_docfreq_offset +
+									mid * sizeof(uint32),
+							&term_off_val,
+							sizeof(uint32));
+
+					data_off = header->tenant_docfreq_offset +
+							   header->num_terms * sizeof(uint32) +
+							   term_off_val;
+
+					tp_segment_read(
+							reader, data_off, &num_tenants, sizeof(uint32));
+
+					if (num_tenants > 0)
+					{
+						TpTenantDocFreq *df_arr;
+						uint32			 k;
+
+						df_arr = palloc(num_tenants * sizeof(TpTenantDocFreq));
+						tp_segment_read(
+								reader,
+								data_off + sizeof(uint32),
+								df_arr,
+								num_tenants * sizeof(TpTenantDocFreq));
+
+						/* Binary search for tenant_id */
+						{
+							int lo = 0;
+							int hi = (int)num_tenants - 1;
+
+							while (lo <= hi)
+							{
+								int m = lo + (hi - lo) / 2;
+								if (df_arr[m].tenant_id == tenant_id)
+								{
+									doc_freq += df_arr[m].doc_freq;
+									break;
+								}
+								else if (df_arr[m].tenant_id < tenant_id)
+									lo = m + 1;
+								else
+									hi = m - 1;
+							}
+						}
+
+						pfree(df_arr);
+						(void)k;
+					}
+					break;
+				}
+				else if (cmp < 0)
+					right = mid - 1;
+				else
+					left = mid + 1;
+			}
+
+			pfree(string_offsets);
+		}
+
+		current = header->next_segment;
+		tp_segment_close(reader);
+	}
+
+	return doc_freq;
+}
+
+/*
+ * Batch per-tenant doc_freq lookup across a segment chain.
+ * ADDS tenant doc_freq to existing values in doc_freqs array.
+ * Falls back to global doc_freq for V3 segments without tenant
+ * data.
+ */
+void
+tp_batch_get_segment_tenant_doc_freq(
+		Relation	index,
+		BlockNumber first_segment,
+		char	  **terms,
+		int			term_count,
+		uint32	   *doc_freqs,
+		uint32		tenant_id)
+{
+	BlockNumber current		= first_segment;
+	char	   *term_buffer = NULL;
+	uint32		buffer_size = 0;
+
+	while (current != InvalidBlockNumber)
+	{
+		TpSegmentReader *reader;
+		TpSegmentHeader *header;
+		TpDictionary	 dict_header;
+		bool			 has_tdf;
+		int				 term_idx;
+
+		reader = tp_segment_open(index, current);
+		if (!reader)
+			break;
+
+		header = reader->header;
+
+		if (header->num_terms == 0 || header->dictionary_offset == 0)
+		{
+			current = header->next_segment;
+			tp_segment_close(reader);
+			continue;
+		}
+
+		has_tdf = (header->flags & TP_FLAG_HAS_TENANT_DATA) &&
+				  header->tenant_docfreq_offset != 0;
+
+		tp_segment_read(
+				reader,
+				header->dictionary_offset,
+				&dict_header,
+				sizeof(dict_header.num_terms));
+
+		for (term_idx = 0; term_idx < term_count; term_idx++)
+		{
+			const char *term  = terms[term_idx];
+			int			left  = 0;
+			int			right = dict_header.num_terms - 1;
+
+			while (left <= right)
+			{
+				int	   mid = left + (right - left) / 2;
+				uint32 string_offset_value;
+				uint32 string_offset;
+				uint32 string_length;
+				int	   cmp;
+
+				tp_segment_read(
+						reader,
+						header->dictionary_offset +
+								sizeof(dict_header.num_terms) +
+								(mid * sizeof(uint32)),
+						&string_offset_value,
+						sizeof(uint32));
+
+				string_offset = header->strings_offset + string_offset_value;
+
+				tp_segment_read(
+						reader, string_offset, &string_length, sizeof(uint32));
+
+				if (string_length + 1 > buffer_size)
+				{
+					if (term_buffer)
+						pfree(term_buffer);
+					buffer_size = string_length + 1;
+					term_buffer = palloc(buffer_size);
+				}
+
+				tp_segment_read(
+						reader,
+						string_offset + sizeof(uint32),
+						term_buffer,
+						string_length);
+				term_buffer[string_length] = '\0';
+
+				cmp = strcmp(term, term_buffer);
+
+				if (cmp == 0)
+				{
+					bool found_tenant = false;
+
+					if (has_tdf)
+					{
+						uint32 tov, doff, nt;
+
+						tp_segment_read(
+								reader,
+								header->tenant_docfreq_offset +
+										mid * sizeof(uint32),
+								&tov,
+								sizeof(uint32));
+
+						doff = header->tenant_docfreq_offset +
+							   header->num_terms * sizeof(uint32) + tov;
+
+						tp_segment_read(reader, doff, &nt, sizeof(uint32));
+
+						if (nt > 0)
+						{
+							TpTenantDocFreq *da;
+							int				 lo = 0, hi = (int)nt - 1;
+
+							da = palloc(nt * sizeof(TpTenantDocFreq));
+							tp_segment_read(
+									reader,
+									doff + sizeof(uint32),
+									da,
+									nt * sizeof(TpTenantDocFreq));
+
+							while (lo <= hi)
+							{
+								int m = lo + (hi - lo) / 2;
+								if (da[m].tenant_id == tenant_id)
+								{
+									doc_freqs[term_idx] += da[m].doc_freq;
+									found_tenant = true;
+									break;
+								}
+								else if (da[m].tenant_id < tenant_id)
+									lo = m + 1;
+								else
+									hi = m - 1;
+							}
+							pfree(da);
+						}
+					}
+
+					/*
+					 * Fallback: V3 segment or tenant not
+					 * found in V4 section — use global
+					 * doc_freq.
+					 */
+					if (!found_tenant)
+					{
+						TpDictEntry de;
+
+						tp_segment_read(
+								reader,
+								header->entries_offset +
+										(mid * sizeof(TpDictEntry)),
+								&de,
+								sizeof(TpDictEntry));
+						doc_freqs[term_idx] += de.doc_freq;
+					}
+					break;
+				}
+				else if (cmp < 0)
+					right = mid - 1;
+				else
+					left = mid + 1;
+			}
+		}
+
+		current = header->next_segment;
+		tp_segment_close(reader);
+	}
+
+	if (term_buffer)
+		pfree(term_buffer);
+}

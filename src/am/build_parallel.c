@@ -43,6 +43,7 @@
 #include "memtable/memtable.h"
 #include "memtable/posting.h"
 #include "memtable/stringtable.h"
+#include "memtable/tenant_stats.h"
 #include "segment/compression.h"
 #include "segment/dictionary.h"
 #include "segment/docmap.h"
@@ -70,7 +71,10 @@ static void tp_init_parallel_shared(
 		dsa_area			  *dsa);
 
 static void tp_leader_process_buffers(
-		TpParallelBuildShared *shared, Relation index, dsa_area *dsa);
+		TpParallelBuildShared *shared,
+		Relation			   index,
+		dsa_area			  *dsa,
+		HTAB				 **accum_tenant_stats_out);
 
 static BlockNumber tp_merge_worker_buffers_to_segment(
 		TpWorkerMemtableBuffer **buffers,
@@ -215,42 +219,72 @@ tp_build_parallel(
 	 * Leader processes worker memtables and writes segments.
 	 * This continues until all workers are done.
 	 */
-	tp_leader_process_buffers(shared, index, dsa);
-
-	/* Wait for all workers to finish */
-	WaitForParallelWorkersToFinish(pcxt);
-
-	/* Report final tuple count */
-	pgstat_progress_update_param(
-			PROGRESS_CREATEIDX_TUPLES_DONE,
-			(int64)pg_atomic_read_u64(&shared->total_docs));
-
-	/* Report compacting phase (metapage update, compaction, truncation) */
-	pgstat_progress_update_param(
-			PROGRESS_CREATEIDX_SUBPHASE, TP_PHASE_COMPACTING);
-
-	/* Update metapage with L0 chain and statistics */
 	{
-		Buffer			metabuf;
-		Page			metapage;
-		TpIndexMetaPage metap;
+		HTAB *accum_tenant_stats = NULL;
 
-		metabuf = ReadBuffer(index, 0);
-		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-		metapage = BufferGetPage(metabuf);
-		metap	 = (TpIndexMetaPage)PageGetContents(metapage);
+		tp_leader_process_buffers(shared, index, dsa, &accum_tenant_stats);
 
-		metap->level_heads[0]  = shared->segment_head;
-		metap->level_counts[0] = shared->segment_count;
-		metap->total_docs = (int32)pg_atomic_read_u64(&shared->total_docs);
-		metap->total_len  = (int64)pg_atomic_read_u64(&shared->total_len);
+		/* Wait for all workers to finish */
+		WaitForParallelWorkersToFinish(pcxt);
 
-		MarkBufferDirty(metabuf);
-		UnlockReleaseBuffer(metabuf);
+		/* Report final tuple count */
+		pgstat_progress_update_param(
+				PROGRESS_CREATEIDX_TUPLES_DONE,
+				(int64)pg_atomic_read_u64(&shared->total_docs));
 
-		/* Run compaction if needed (threshold is 8 segments per level) */
-		tp_maybe_compact_level(index, 0);
-	}
+		/* Report compacting phase (metapage update, compaction, truncation) */
+		pgstat_progress_update_param(
+				PROGRESS_CREATEIDX_SUBPHASE, TP_PHASE_COMPACTING);
+
+		/* Update metapage with L0 chain and statistics */
+		{
+			Buffer			metabuf;
+			Page			metapage;
+			TpIndexMetaPage metap;
+
+			metabuf = ReadBuffer(index, 0);
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+			metapage = BufferGetPage(metabuf);
+			metap	 = (TpIndexMetaPage)PageGetContents(metapage);
+
+			metap->level_heads[0]  = shared->segment_head;
+			metap->level_counts[0] = shared->segment_count;
+			metap->total_docs = (int32)pg_atomic_read_u64(&shared->total_docs);
+			metap->total_len  = (int64)pg_atomic_read_u64(&shared->total_len);
+
+			MarkBufferDirty(metabuf);
+			UnlockReleaseBuffer(metabuf);
+
+			/* Run compaction if needed (threshold is 8 segments per level) */
+			tp_maybe_compact_level(index, 0);
+		}
+
+		/* Write accumulated per-tenant stats to disk */
+		if (accum_tenant_stats != NULL)
+		{
+			int					n_entries;
+			TpTenantStatsEntry *entries_arr;
+			HASH_SEQ_STATUS		seq;
+			TpTenantStatsEntry *e;
+			int					idx = 0;
+
+			n_entries = hash_get_num_entries(accum_tenant_stats);
+			if (n_entries > 0)
+			{
+				entries_arr = palloc(n_entries * sizeof(TpTenantStatsEntry));
+				hash_seq_init(&seq, accum_tenant_stats);
+				while ((e = (TpTenantStatsEntry *)hash_seq_search(&seq)) !=
+					   NULL)
+				{
+					entries_arr[idx++] = *e;
+				}
+				tp_write_tenant_stats_pages_from_array(
+						index, entries_arr, n_entries);
+				pfree(entries_arr);
+			}
+			hash_destroy(accum_tenant_stats);
+		}
+	} /* end accum_tenant_stats scope */
 
 	/*
 	 * Final truncation: after compaction, L0 segment pages are freed but the
@@ -431,6 +465,18 @@ tp_init_parallel_shared(
 			worker_states[i].buffers[j].doc_lengths_handle =
 					dshash_get_hash_table_handle(doclength_table);
 			dshash_detach(doclength_table);
+
+			/* Create tenant stats table if tenant column set */
+			if (tenant_attnum != InvalidAttrNumber)
+			{
+				worker_states[i].buffers[j].tenant_stats_handle =
+						tp_tenant_stats_create(dsa);
+			}
+			else
+			{
+				worker_states[i].buffers[j].tenant_stats_handle =
+						DSHASH_HANDLE_INVALID;
+			}
 
 			worker_states[i].buffers[j].num_docs	   = 0;
 			worker_states[i].buffers[j].total_len	   = 0;
@@ -820,6 +866,7 @@ typedef struct TpCollectedBufferPosting
 {
 	ItemPointerData ctid;
 	uint16			frequency;
+	uint32			tenant_id;
 } TpCollectedBufferPosting;
 
 /*
@@ -877,6 +924,10 @@ collect_buffer_term_postings(
 				psources[min_idx]
 						.entries[psources[min_idx].current_idx]
 						.frequency;
+		postings[num].tenant_id =
+				psources[min_idx]
+						.entries[psources[min_idx].current_idx]
+						.tenant_id;
 		num++;
 
 		buffer_posting_source_advance(&psources[min_idx]);
@@ -949,6 +1000,122 @@ typedef struct MergeTermBlockInfo
 } MergeTermBlockInfo;
 
 /*
+ * Per-term tenant doc_freq accumulation entry (local HTAB).
+ */
+typedef struct MergeTenantDfEntry
+{
+	uint32 tenant_id; /* hash key */
+	uint32 doc_freq;
+} MergeTenantDfEntry;
+
+/*
+ * Per-term tenant doc_freq data for parallel-merge segment.
+ */
+typedef struct MergeTenantDfData
+{
+	TpTenantDocFreq *entries; /* Sorted by tenant_id */
+	uint32			 num_tenants;
+} MergeTenantDfData;
+
+/*
+ * Comparison for sorting TpTenantDocFreq by tenant_id.
+ */
+static int
+merge_cmp_tenant_docfreq(const void *a, const void *b)
+{
+	const TpTenantDocFreq *ta = (const TpTenantDocFreq *)a;
+	const TpTenantDocFreq *tb = (const TpTenantDocFreq *)b;
+
+	if (ta->tenant_id < tb->tenant_id)
+		return -1;
+	if (ta->tenant_id > tb->tenant_id)
+		return 1;
+	return 0;
+}
+
+/*
+ * Comparison for sorting TpTenantStats by tenant_id.
+ */
+static int
+merge_cmp_tenant_stats(const void *a, const void *b)
+{
+	const TpTenantStats *ta = (const TpTenantStats *)a;
+	const TpTenantStats *tb = (const TpTenantStats *)b;
+
+	if (ta->tenant_id < tb->tenant_id)
+		return -1;
+	if (ta->tenant_id > tb->tenant_id)
+		return 1;
+	return 0;
+}
+
+/*
+ * Compute per-tenant doc_freq for a term from collected
+ * buffer postings.  Returns sorted array + count.
+ */
+static MergeTenantDfData
+compute_merge_tenant_docfreq(
+		TpCollectedBufferPosting *postings, uint32 doc_count)
+{
+	MergeTenantDfData	result = {NULL, 0};
+	HASHCTL				ctl;
+	HTAB			   *ht;
+	uint32				i;
+	HASH_SEQ_STATUS		seq;
+	MergeTenantDfEntry *e;
+	uint32				idx = 0;
+
+	if (doc_count == 0)
+		return result;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize	  = sizeof(uint32);
+	ctl.entrysize = sizeof(MergeTenantDfEntry);
+	ht = hash_create("MergeTenantDF", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+
+	for (i = 0; i < doc_count; i++)
+	{
+		uint32				tid = postings[i].tenant_id;
+		MergeTenantDfEntry *te;
+		bool				found;
+
+		if (tid == 0)
+			continue;
+
+		te = hash_search(ht, &tid, HASH_ENTER, &found);
+		if (!found)
+		{
+			te->tenant_id = tid;
+			te->doc_freq  = 1;
+		}
+		else
+		{
+			te->doc_freq++;
+		}
+	}
+
+	result.num_tenants = hash_get_num_entries(ht);
+	if (result.num_tenants > 0)
+	{
+		result.entries = palloc(result.num_tenants * sizeof(TpTenantDocFreq));
+		hash_seq_init(&seq, ht);
+		while ((e = (MergeTenantDfEntry *)hash_seq_search(&seq)) != NULL)
+		{
+			result.entries[idx].tenant_id = e->tenant_id;
+			result.entries[idx].doc_freq  = e->doc_freq;
+			idx++;
+		}
+		qsort(result.entries,
+			  result.num_tenants,
+			  sizeof(TpTenantDocFreq),
+			  merge_cmp_tenant_docfreq);
+	}
+
+	hash_destroy(ht);
+	return result;
+}
+
+/*
  * Write a segment by streaming N-way merge directly from worker buffers.
  *
  * This is the core function that merges multiple worker buffers into a single
@@ -984,6 +1151,10 @@ tp_merge_worker_buffers_to_segment(
 	uint32				 skip_entries_count;
 	uint32				 skip_entries_capacity;
 	int64				 total_len = 0;
+
+	/* V4 per-tenant tracking */
+	MergeTenantDfData *term_tenant_df  = NULL;
+	bool			   has_tenant_data = false;
 
 	if (num_buffers == 0)
 		return InvalidBlockNumber;
@@ -1163,6 +1334,18 @@ tp_merge_worker_buffers_to_segment(
 	/* Initialize per-term tracking and skip entry accumulator */
 	term_blocks = palloc0(num_merged_terms * sizeof(MergeTermBlockInfo));
 
+	/* Check if any buffer has tenant data for V4 sections */
+	for (i = 0; i < (uint32)num_buffers; i++)
+	{
+		if (buffers[i]->tenant_stats_handle != DSHASH_HANDLE_INVALID)
+		{
+			has_tenant_data = true;
+			break;
+		}
+	}
+	if (has_tenant_data)
+		term_tenant_df = palloc0(num_merged_terms * sizeof(MergeTenantDfData));
+
 	skip_entries_capacity = 1024;
 	skip_entries_count	  = 0;
 	all_skip_entries = palloc(skip_entries_capacity * sizeof(TpSkipEntry));
@@ -1188,6 +1371,11 @@ tp_merge_worker_buffers_to_segment(
 		postings = collect_buffer_term_postings(
 				&merged_terms[i], sources, &doc_count);
 		term_blocks[i].doc_freq = doc_count;
+
+		/* Compute per-tenant doc_freq for V4 sections */
+		if (has_tenant_data && postings != NULL && doc_count > 0)
+			term_tenant_df[i] =
+					compute_merge_tenant_docfreq(postings, doc_count);
 
 		if (doc_count == 0 || postings == NULL)
 		{
@@ -1330,6 +1518,143 @@ tp_merge_worker_buffers_to_segment(
 	{
 		tp_segment_writer_write(
 				&writer, docmap->fieldnorms, docmap->num_docs * sizeof(uint8));
+	}
+
+	/*
+	 * V4 tenant sections: per-tenant corpus stats and
+	 * per-term per-tenant doc_freq.
+	 */
+	if (has_tenant_data)
+	{
+		/* Write tenant_stats section from buffer dshash tables */
+		header.tenant_stats_offset = writer.current_offset;
+		{
+			HASHCTL				ctl;
+			HTAB			   *accum;
+			uint32				j;
+			TpTenantStatsEntry *te;
+			HASH_SEQ_STATUS		seq;
+
+			memset(&ctl, 0, sizeof(ctl));
+			ctl.keysize	  = sizeof(uint32);
+			ctl.entrysize = sizeof(TpTenantStatsEntry);
+			accum		  = hash_create(
+					"MergeTenantStats", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+
+			/* Accumulate from all buffer tenant_stats */
+			for (j = 0; j < (uint32)num_buffers; j++)
+			{
+				dshash_table	   *ts;
+				dshash_seq_status	dseq;
+				TpTenantStatsEntry *de;
+
+				if (buffers[j]->tenant_stats_handle == DSHASH_HANDLE_INVALID)
+					continue;
+
+				ts = tp_tenant_stats_attach(
+						dsa, buffers[j]->tenant_stats_handle);
+				dshash_seq_init(&dseq, ts, false);
+				while ((de = (TpTenantStatsEntry *)dshash_seq_next(&dseq)) !=
+					   NULL)
+				{
+					TpTenantStatsEntry *local;
+					bool				found;
+
+					local = hash_search(
+							accum, &de->tenant_id, HASH_ENTER, &found);
+					if (!found)
+					{
+						local->tenant_id = de->tenant_id;
+						local->doc_count = de->doc_count;
+						local->total_len = de->total_len;
+					}
+					else
+					{
+						local->doc_count += de->doc_count;
+						local->total_len += de->total_len;
+					}
+				}
+				dshash_seq_term(&dseq);
+				dshash_detach(ts);
+			}
+
+			{
+				long ts_count = hash_get_num_entries(accum);
+
+				if (ts_count > 0)
+				{
+					TpTenantStats *seg_ts;
+					uint32		   idx = 0;
+
+					seg_ts = palloc(ts_count * sizeof(TpTenantStats));
+					hash_seq_init(&seq, accum);
+					while ((te = (TpTenantStatsEntry *)hash_seq_search(
+									&seq)) != NULL)
+					{
+						seg_ts[idx].tenant_id	 = te->tenant_id;
+						seg_ts[idx].num_docs	 = te->doc_count;
+						seg_ts[idx].total_tokens = te->total_len;
+						idx++;
+					}
+					qsort(seg_ts,
+						  ts_count,
+						  sizeof(TpTenantStats),
+						  merge_cmp_tenant_stats);
+					{
+						uint32 cnt = (uint32)ts_count;
+
+						tp_segment_writer_write(&writer, &cnt, sizeof(uint32));
+					}
+					tp_segment_writer_write(
+							&writer, seg_ts, ts_count * sizeof(TpTenantStats));
+					pfree(seg_ts);
+				}
+				else
+				{
+					uint32 zero = 0;
+
+					tp_segment_writer_write(&writer, &zero, sizeof(uint32));
+				}
+			}
+
+			hash_destroy(accum);
+		}
+
+		/* Write tenant_docfreq section */
+		header.tenant_docfreq_offset = writer.current_offset;
+		{
+			uint32 *term_off;
+			uint32	cur = 0;
+
+			term_off = palloc0(num_merged_terms * sizeof(uint32));
+			for (i = 0; i < num_merged_terms; i++)
+			{
+				term_off[i] = cur;
+				cur += sizeof(uint32) +
+					   term_tenant_df[i].num_tenants * sizeof(TpTenantDocFreq);
+			}
+
+			tp_segment_writer_write(
+					&writer, term_off, num_merged_terms * sizeof(uint32));
+
+			for (i = 0; i < num_merged_terms; i++)
+			{
+				uint32 nt = term_tenant_df[i].num_tenants;
+
+				tp_segment_writer_write(&writer, &nt, sizeof(uint32));
+				if (nt > 0)
+				{
+					tp_segment_writer_write(
+							&writer,
+							term_tenant_df[i].entries,
+							nt * sizeof(TpTenantDocFreq));
+				}
+			}
+
+			pfree(term_off);
+		}
+
+		header.flags |= TP_FLAG_HAS_TENANT_DATA;
 	}
 
 	/* Flush writer before writing page index and dict entries */
@@ -1481,6 +1806,15 @@ tp_merge_worker_buffers_to_segment(
 	pfree(term_blocks);
 	pfree(all_skip_entries);
 	pfree(string_offsets);
+	if (term_tenant_df)
+	{
+		for (i = 0; i < num_merged_terms; i++)
+		{
+			if (term_tenant_df[i].entries)
+				pfree(term_tenant_df[i].entries);
+		}
+		pfree(term_tenant_df);
+	}
 	tp_docmap_destroy(docmap);
 	tp_segment_writer_finish(&writer);
 
@@ -1556,6 +1890,15 @@ clear_worker_buffer(dsa_area *dsa, TpWorkerMemtableBuffer *buffer)
 		dshash_detach(new_doc_table);
 	}
 
+	/* Destroy and recreate tenant stats table */
+	if (buffer->tenant_stats_handle != DSHASH_HANDLE_INVALID)
+	{
+		dshash_table *old_ts =
+				tp_tenant_stats_attach(dsa, buffer->tenant_stats_handle);
+		dshash_destroy(old_ts);
+		buffer->tenant_stats_handle = tp_tenant_stats_create(dsa);
+	}
+
 	/* Clear buffer stats */
 	buffer->num_docs	   = 0;
 	buffer->total_len	   = 0;
@@ -1578,19 +1921,41 @@ clear_worker_buffer(dsa_area *dsa, TpWorkerMemtableBuffer *buffer)
  */
 static void
 tp_leader_process_buffers(
-		TpParallelBuildShared *shared, Relation index, dsa_area *dsa)
+		TpParallelBuildShared *shared,
+		Relation			   index,
+		dsa_area			  *dsa,
+		HTAB				 **accum_tenant_stats_out)
 {
 	TpWorkerState			*worker_states = TpParallelWorkerStates(shared);
 	TpWorkerMemtableBuffer **ready_buffers;
 	int						 num_ready;
 	int						 max_ready;
-	bool					 all_done	= false;
-	uint32					 total_docs = 0;
-	int64					 total_len	= 0;
+	bool					 all_done			= false;
+	uint32					 total_docs			= 0;
+	int64					 total_len			= 0;
+	HTAB					*accum_tenant_stats = NULL;
 
 	/* Allocate array to track ready buffers */
 	max_ready	  = shared->nworkers * 2; /* 2 buffers per worker */
 	ready_buffers = palloc(sizeof(TpWorkerMemtableBuffer *) * max_ready);
+
+	/*
+	 * Create local HTAB to accumulate per-tenant stats from all
+	 * worker buffers. Only needed if tenant column is configured.
+	 */
+	if (shared->tenant_attnum != InvalidAttrNumber)
+	{
+		HASHCTL ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize		   = sizeof(uint32);
+		ctl.entrysize	   = sizeof(TpTenantStatsEntry);
+		accum_tenant_stats = hash_create(
+				"Parallel Build Tenant Stats",
+				64,
+				&ctl,
+				HASH_ELEM | HASH_BLOBS);
+	}
 
 	while (!all_done)
 	{
@@ -1685,6 +2050,51 @@ tp_leader_process_buffers(
 				shared->segment_count++;
 			}
 
+			/* Accumulate per-tenant stats before clearing buffers */
+			if (accum_tenant_stats != NULL)
+			{
+				for (i = 0; i < num_ready; i++)
+				{
+					TpWorkerMemtableBuffer *buf = ready_buffers[i];
+
+					if (buf->tenant_stats_handle != DSHASH_HANDLE_INVALID)
+					{
+						dshash_table	   *ts;
+						dshash_seq_status	seq;
+						TpTenantStatsEntry *e;
+
+						ts = tp_tenant_stats_attach(
+								dsa, buf->tenant_stats_handle);
+						dshash_seq_init(&seq, ts, false);
+						while ((e = (TpTenantStatsEntry *)dshash_seq_next(
+										&seq)) != NULL)
+						{
+							TpTenantStatsEntry *local;
+							bool				found;
+
+							local = hash_search(
+									accum_tenant_stats,
+									&e->tenant_id,
+									HASH_ENTER,
+									&found);
+							if (!found)
+							{
+								local->tenant_id = e->tenant_id;
+								local->doc_count = e->doc_count;
+								local->total_len = e->total_len;
+							}
+							else
+							{
+								local->doc_count += e->doc_count;
+								local->total_len += e->total_len;
+							}
+						}
+						dshash_seq_term(&seq);
+						dshash_detach(ts);
+					}
+				}
+			}
+
 			/* Clear processed buffers and signal workers */
 			for (i = 0; i < num_ready; i++)
 			{
@@ -1725,6 +2135,10 @@ tp_leader_process_buffers(
 	/* Update corpus statistics in shared state */
 	pg_atomic_write_u64(&shared->total_docs, total_docs);
 	pg_atomic_write_u64(&shared->total_len, total_len);
+
+	/* Pass accumulated tenant stats back to caller */
+	if (accum_tenant_stats_out)
+		*accum_tenant_stats_out = accum_tenant_stats;
 
 	/* Cleanup */
 	pfree(ready_buffers);
@@ -2050,6 +2464,31 @@ tp_worker_process_document(
 	/* Update statistics */
 	buffer->num_docs++;
 	buffer->total_len += doc_length;
+
+	/* Update per-tenant statistics */
+	if (tenant_id != 0 && buffer->tenant_stats_handle != DSHASH_HANDLE_INVALID)
+	{
+		dshash_table	   *ts_table;
+		TpTenantStatsEntry *ts_entry;
+		bool				found;
+
+		ts_table = tp_tenant_stats_attach(dsa, buffer->tenant_stats_handle);
+		ts_entry = (TpTenantStatsEntry *)
+				dshash_find_or_insert(ts_table, &tenant_id, &found);
+		if (!found)
+		{
+			ts_entry->tenant_id = tenant_id;
+			ts_entry->doc_count = 1;
+			ts_entry->total_len = doc_length;
+		}
+		else
+		{
+			ts_entry->doc_count++;
+			ts_entry->total_len += doc_length;
+		}
+		dshash_release_lock(ts_table, ts_entry);
+		dshash_detach(ts_table);
+	}
 }
 
 /*

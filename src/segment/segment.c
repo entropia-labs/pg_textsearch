@@ -31,6 +31,7 @@
 #include "memtable/memtable.h"
 #include "memtable/posting.h"
 #include "memtable/stringtable.h"
+#include "memtable/tenant_stats.h"
 #include "pagemapper.h"
 #include "segment.h"
 #include "state/metapage.h"
@@ -854,10 +855,126 @@ typedef struct TermBlockInfo
 } TermBlockInfo;
 
 /*
+ * Per-term tenant doc_freq accumulation entry (local HTAB).
+ */
+typedef struct TermTenantDocFreqEntry
+{
+	uint32 tenant_id; /* hash key */
+	uint32 doc_freq;
+} TermTenantDocFreqEntry;
+
+/*
+ * Per-term tenant doc_freq data for the segment.
+ */
+typedef struct TermTenantDocFreqData
+{
+	TpTenantDocFreq *entries; /* Sorted by tenant_id */
+	uint32			 num_tenants;
+} TermTenantDocFreqData;
+
+/*
+ * Comparison function for sorting TpTenantDocFreq by tenant_id.
+ */
+static int
+compare_tenant_docfreq(const void *a, const void *b)
+{
+	const TpTenantDocFreq *ta = (const TpTenantDocFreq *)a;
+	const TpTenantDocFreq *tb = (const TpTenantDocFreq *)b;
+
+	if (ta->tenant_id < tb->tenant_id)
+		return -1;
+	if (ta->tenant_id > tb->tenant_id)
+		return 1;
+	return 0;
+}
+
+/*
+ * Comparison function for sorting TpTenantStats by tenant_id.
+ */
+static int
+compare_tenant_stats(const void *a, const void *b)
+{
+	const TpTenantStats *ta = (const TpTenantStats *)a;
+	const TpTenantStats *tb = (const TpTenantStats *)b;
+
+	if (ta->tenant_id < tb->tenant_id)
+		return -1;
+	if (ta->tenant_id > tb->tenant_id)
+		return 1;
+	return 0;
+}
+
+/*
+ * Compute per-tenant doc_freq for a term from posting entries.
+ * Returns sorted array of TpTenantDocFreq and count.
+ */
+static TermTenantDocFreqData
+compute_term_tenant_docfreq(TpPostingEntry *entries, uint32 doc_count)
+{
+	TermTenantDocFreqData	result = {NULL, 0};
+	HASHCTL					ctl;
+	HTAB				   *ht;
+	uint32					i;
+	HASH_SEQ_STATUS			seq;
+	TermTenantDocFreqEntry *e;
+	uint32					idx = 0;
+
+	if (doc_count == 0)
+		return result;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize	  = sizeof(uint32);
+	ctl.entrysize = sizeof(TermTenantDocFreqEntry);
+	ht = hash_create("TermTenantDF", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+
+	for (i = 0; i < doc_count; i++)
+	{
+		uint32					tid = entries[i].tenant_id;
+		TermTenantDocFreqEntry *te;
+		bool					found;
+
+		if (tid == 0)
+			continue;
+
+		te = hash_search(ht, &tid, HASH_ENTER, &found);
+		if (!found)
+		{
+			te->tenant_id = tid;
+			te->doc_freq  = 1;
+		}
+		else
+		{
+			te->doc_freq++;
+		}
+	}
+
+	result.num_tenants = hash_get_num_entries(ht);
+	if (result.num_tenants > 0)
+	{
+		result.entries = palloc(result.num_tenants * sizeof(TpTenantDocFreq));
+		hash_seq_init(&seq, ht);
+		while ((e = hash_seq_search(&seq)) != NULL)
+		{
+			result.entries[idx].tenant_id = e->tenant_id;
+			result.entries[idx].doc_freq  = e->doc_freq;
+			idx++;
+		}
+		/* Sort by tenant_id for binary search at read time */
+		qsort(result.entries,
+			  result.num_tenants,
+			  sizeof(TpTenantDocFreq),
+			  compare_tenant_docfreq);
+	}
+
+	hash_destroy(ht);
+	return result;
+}
+
+/*
  * Write segment from memtable with streaming format.
  *
  * Layout: [header] → [dictionary] → [postings] → [skip index] →
- *         [fieldnorm] → [ctid map]
+ *         [fieldnorm] → [ctid map] → [tenant sections]
  *
  * This matches the merge format: postings written before skip index.
  */
@@ -885,6 +1002,10 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	TpSkipEntry *all_skip_entries;
 	uint32		 skip_entries_count;
 	uint32		 skip_entries_capacity;
+
+	/* V4 per-tenant doc_freq tracking */
+	TermTenantDocFreqData *term_tenant_df  = NULL;
+	bool				   has_tenant_data = false;
 
 	/* Initialize the writer to avoid garbage values */
 	memset(&writer, 0, sizeof(TpSegmentWriter));
@@ -982,6 +1103,18 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	/* Initialize per-term tracking and skip entry accumulator */
 	term_blocks = palloc0(num_terms * sizeof(TermBlockInfo));
 
+	/* Check if index has tenant data */
+	{
+		TpMemtable *mt = get_memtable(state);
+
+		if (mt && mt->tenant_stats_handle != DSHASH_HANDLE_INVALID)
+		{
+			has_tenant_data = true;
+			term_tenant_df	= palloc0(
+					 num_terms * sizeof(TermTenantDocFreqData));
+		}
+	}
+
 	skip_entries_capacity = 1024;
 	skip_entries_count	  = 0;
 	all_skip_entries = palloc(skip_entries_capacity * sizeof(TpSkipEntry));
@@ -1015,6 +1148,11 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 		}
 
 		term_blocks[i].doc_freq = posting_list ? posting_list->doc_freq : 0;
+
+		/* Compute per-tenant doc_freq for V4 sections */
+		if (has_tenant_data && entries != NULL && doc_count > 0)
+			term_tenant_df[i] =
+					compute_term_tenant_docfreq(entries, doc_count);
 
 		if (doc_count == 0)
 		{
@@ -1163,6 +1301,108 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	/* Update num_docs to actual count from this segment */
 	header.num_docs = docmap->num_docs;
 
+	/*
+	 * V4 tenant sections: write per-tenant corpus stats and
+	 * per-term per-tenant doc_freq.
+	 */
+	if (has_tenant_data)
+	{
+		/* Write tenant_stats section */
+		header.tenant_stats_offset = writer.current_offset;
+		{
+			TpTenantStatsEntry *ts_entries;
+			int					ts_count;
+
+			ts_count = tp_tenant_stats_collect(state, &ts_entries);
+			if (ts_count > 0)
+			{
+				uint32		   j;
+				TpTenantStats *seg_ts;
+
+				seg_ts = palloc(ts_count * sizeof(TpTenantStats));
+				for (j = 0; j < (uint32)ts_count; j++)
+				{
+					seg_ts[j].tenant_id	   = ts_entries[j].tenant_id;
+					seg_ts[j].num_docs	   = ts_entries[j].doc_count;
+					seg_ts[j].total_tokens = ts_entries[j].total_len;
+				}
+				qsort(seg_ts,
+					  ts_count,
+					  sizeof(TpTenantStats),
+					  compare_tenant_stats);
+
+				{
+					uint32 cnt = (uint32)ts_count;
+
+					tp_segment_writer_write(&writer, &cnt, sizeof(uint32));
+				}
+				tp_segment_writer_write(
+						&writer, seg_ts, ts_count * sizeof(TpTenantStats));
+				pfree(seg_ts);
+				pfree(ts_entries);
+			}
+			else
+			{
+				uint32 zero = 0;
+
+				tp_segment_writer_write(&writer, &zero, sizeof(uint32));
+			}
+		}
+
+		/* Write tenant_docfreq section */
+		header.tenant_docfreq_offset = writer.current_offset;
+		{
+			uint32 *term_offsets;
+			uint32	base_offset;
+
+			/*
+			 * Layout: uint32 term_offsets[num_terms], then
+			 * per-term: uint32 num_tenants +
+			 * TpTenantDocFreq[num_tenants]
+			 */
+			term_offsets = palloc0(num_terms * sizeof(uint32));
+
+			/* Reserve space for term_offsets array */
+			base_offset = writer.current_offset + num_terms * sizeof(uint32);
+
+			/* Calculate offsets */
+			{
+				uint32 cur = 0;
+
+				for (i = 0; i < num_terms; i++)
+				{
+					term_offsets[i] = cur;
+					cur += sizeof(uint32) + term_tenant_df[i].num_tenants *
+													sizeof(TpTenantDocFreq);
+				}
+			}
+
+			/* Write term_offsets array */
+			tp_segment_writer_write(
+					&writer, term_offsets, num_terms * sizeof(uint32));
+
+			/* Write per-term tenant doc_freq data */
+			for (i = 0; i < num_terms; i++)
+			{
+				uint32 nt = term_tenant_df[i].num_tenants;
+
+				tp_segment_writer_write(&writer, &nt, sizeof(uint32));
+				if (nt > 0)
+				{
+					tp_segment_writer_write(
+							&writer,
+							term_tenant_df[i].entries,
+							nt * sizeof(TpTenantDocFreq));
+				}
+			}
+
+			pfree(term_offsets);
+			(void)base_offset;
+		}
+
+		header.flags |= TP_FLAG_HAS_TENANT_DATA;
+	}
+
 	/* Write page index */
 	tp_segment_writer_flush(&writer);
 
@@ -1302,17 +1542,20 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	header_page = BufferGetPage(header_buf);
 
 	existing_header = (TpSegmentHeader *)PageGetContents(header_page);
-	existing_header->strings_offset		 = header.strings_offset;
-	existing_header->entries_offset		 = header.entries_offset;
-	existing_header->postings_offset	 = header.postings_offset;
-	existing_header->skip_index_offset	 = header.skip_index_offset;
-	existing_header->fieldnorm_offset	 = header.fieldnorm_offset;
-	existing_header->ctid_pages_offset	 = header.ctid_pages_offset;
-	existing_header->ctid_offsets_offset = header.ctid_offsets_offset;
-	existing_header->num_docs			 = header.num_docs;
-	existing_header->data_size			 = header.data_size;
-	existing_header->num_pages			 = header.num_pages;
-	existing_header->page_index			 = header.page_index;
+	existing_header->strings_offset		   = header.strings_offset;
+	existing_header->entries_offset		   = header.entries_offset;
+	existing_header->postings_offset	   = header.postings_offset;
+	existing_header->skip_index_offset	   = header.skip_index_offset;
+	existing_header->fieldnorm_offset	   = header.fieldnorm_offset;
+	existing_header->ctid_pages_offset	   = header.ctid_pages_offset;
+	existing_header->ctid_offsets_offset   = header.ctid_offsets_offset;
+	existing_header->num_docs			   = header.num_docs;
+	existing_header->data_size			   = header.data_size;
+	existing_header->num_pages			   = header.num_pages;
+	existing_header->page_index			   = header.page_index;
+	existing_header->tenant_stats_offset   = header.tenant_stats_offset;
+	existing_header->tenant_docfreq_offset = header.tenant_docfreq_offset;
+	existing_header->flags				   = header.flags;
 
 	MarkBufferDirty(header_buf);
 	UnlockReleaseBuffer(header_buf);
@@ -1323,6 +1566,15 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	tp_free_dictionary(terms, num_terms);
 	pfree(string_offsets);
 	pfree(term_blocks);
+	if (term_tenant_df)
+	{
+		for (i = 0; i < num_terms; i++)
+		{
+			if (term_tenant_df[i].entries)
+				pfree(term_tenant_df[i].entries);
+		}
+		pfree(term_tenant_df);
+	}
 	tp_docmap_destroy(docmap);
 	if (writer.pages)
 		pfree(writer.pages);

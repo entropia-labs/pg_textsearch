@@ -15,7 +15,8 @@
 
 #include "constants.h"
 
-typedef struct TpLocalIndexState TpLocalIndexState;
+typedef struct TpLocalIndexState  TpLocalIndexState;
+typedef struct TpTenantStatsEntry TpTenantStatsEntry;
 
 /*
  * Tapir Index Metapage Structure
@@ -90,5 +91,7 @@ extern void tp_invalidate_docid_cache(void);
  */
 extern void
 tp_write_tenant_stats_pages(Relation index, TpLocalIndexState *local_state);
+extern void tp_write_tenant_stats_pages_from_array(
+		Relation index, TpTenantStatsEntry *entries, int count);
 extern void
 tp_read_tenant_stats_pages(Relation index, TpLocalIndexState *local_state);
