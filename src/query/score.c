@@ -859,7 +859,8 @@ tp_score_documents(
 				k1,
 				b,
 				avg_doc_len,
-				doc_scores_hash);
+				doc_scores_hash,
+				tenant_id);
 	}
 
 	/* Free unified doc_freqs array */

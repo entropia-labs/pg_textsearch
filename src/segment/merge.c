@@ -91,54 +91,6 @@ read_segment_tenant_stats(TpSegmentReader *reader, TpTenantStats **stats_out)
 }
 
 /*
- * Read per-term tenant doc_freq from a V4 segment for a given
- * term index. Returns array and count. Caller must pfree.
- */
-static int
-read_segment_term_tenant_docfreq(
-		TpSegmentReader *reader, uint32 term_idx, TpTenantDocFreq **df_out)
-{
-	TpSegmentHeader *header = reader->header;
-	uint32			 term_offset;
-	uint32			 num_tenants;
-	uint32			 data_offset;
-
-	*df_out = NULL;
-
-	if (!(header->flags & TP_FLAG_HAS_TENANT_DATA))
-		return 0;
-	if (header->tenant_docfreq_offset == 0)
-		return 0;
-	if (term_idx >= header->num_terms)
-		return 0;
-
-	/* Read term_offsets[term_idx] */
-	tp_segment_read(
-			reader,
-			header->tenant_docfreq_offset + term_idx * sizeof(uint32),
-			&term_offset,
-			sizeof(uint32));
-
-	/* Data starts after the term_offsets array */
-	data_offset = header->tenant_docfreq_offset +
-				  header->num_terms * sizeof(uint32) + term_offset;
-
-	/* Read num_tenants */
-	tp_segment_read(reader, data_offset, &num_tenants, sizeof(uint32));
-
-	if (num_tenants == 0)
-		return 0;
-
-	*df_out = palloc(num_tenants * sizeof(TpTenantDocFreq));
-	tp_segment_read(
-			reader,
-			data_offset + sizeof(uint32),
-			*df_out,
-			num_tenants * sizeof(TpTenantDocFreq));
-	return (int)num_tenants;
-}
-
-/*
  * Merge source state - tracks current position in each source segment
  * Updated for segment format.
  */
@@ -805,6 +757,7 @@ typedef struct CollectedPosting
 	uint32			old_doc_id; /* Doc ID in source segment */
 	uint16			frequency;
 	uint8			fieldnorm; /* Already encoded */
+	uint32			tenant_id; /* Tenant ID from source segment */
 } CollectedPosting;
 
 /*
@@ -861,6 +814,9 @@ collect_term_postings(
 		postings[num].old_doc_id = psources[min_idx].current.old_doc_id;
 		postings[num].frequency	 = psources[min_idx].current.frequency;
 		postings[num].fieldnorm	 = psources[min_idx].current.fieldnorm;
+		postings[num].tenant_id	 = tp_segment_get_tenant_id(
+				 psources[min_idx].reader,
+				 psources[min_idx].current.old_doc_id);
 		num++;
 
 		posting_source_advance(&psources[min_idx]);
@@ -1053,6 +1009,10 @@ write_merged_segment(
 			block_postings[j].frequency = postings[j].frequency;
 			block_postings[j].fieldnorm = postings[j].fieldnorm;
 			block_postings[j].reserved	= 0;
+
+			if (postings[j].tenant_id != 0)
+				tp_docmap_set_tenant_id(
+						docmap, new_doc_id, postings[j].tenant_id);
 		}
 
 		/* Write posting blocks and build skip entries */
@@ -1170,6 +1130,17 @@ write_merged_segment(
 				docmap->num_docs * sizeof(OffsetNumber));
 	}
 
+	/* Write tenant_map section (uint32 per doc, V4) */
+	header.tenant_map_offset = 0;
+	if (docmap->num_docs > 0 && docmap->tenant_ids != NULL)
+	{
+		header.tenant_map_offset = writer.current_offset;
+		tp_segment_writer_write(
+				&writer,
+				docmap->tenant_ids,
+				docmap->num_docs * sizeof(uint32));
+	}
+
 	/*
 	 * V4 tenant sections: merge per-tenant data from source segments.
 	 */
@@ -1255,27 +1226,16 @@ write_merged_segment(
 				hash_destroy(accum);
 			}
 
-			/* Merge tenant_docfreq from sources per term */
+			/*
+			 * Merge tenant_docfreq: recompute from collected
+			 * postings. We re-collect each term's postings and
+			 * count per-tenant doc_freq from tenant_id field.
+			 */
 			header.tenant_docfreq_offset = writer.current_offset;
 			{
 				uint32 *tdf_offsets;
 				uint32	cur_offset = 0;
 
-				/*
-				 * Two passes: first compute sizes to build
-				 * offset array, then write data.
-				 *
-				 * Simpler: write offsets placeholder, then
-				 * data, then fix up offsets.
-				 * Even simpler: just stream. Write offsets
-				 * array (computed), then per-term data.
-				 */
-				tdf_offsets = palloc0(num_terms * sizeof(uint32));
-
-				/*
-				 * First pass: compute merged per-term tenant
-				 * docfreq and sizes.
-				 */
 				typedef struct MergedTermTDF
 				{
 					TpTenantDocFreq *entries;
@@ -1284,13 +1244,19 @@ write_merged_segment(
 
 				MergedTermTDF *merged_tdf;
 
-				merged_tdf = palloc0(num_terms * sizeof(MergedTermTDF));
+				tdf_offsets = palloc0(num_terms * sizeof(uint32));
+				merged_tdf	= palloc0(num_terms * sizeof(MergedTermTDF));
 
 				for (i = 0; i < num_terms; i++)
 				{
-					HASHCTL ctl;
-					HTAB   *tht;
-					uint32	j;
+					CollectedPosting *tpostings;
+					uint32			  tcount = 0;
+					HASHCTL			  ctl;
+					HTAB			 *tht;
+					uint32			  j;
+
+					tpostings =
+							collect_term_postings(&terms[i], sources, &tcount);
 
 					memset(&ctl, 0, sizeof(ctl));
 					ctl.keysize	  = sizeof(uint32);
@@ -1298,66 +1264,55 @@ write_merged_segment(
 					tht			  = hash_create(
 							  "MergeTermTDF", 16, &ctl, HASH_ELEM | HASH_BLOBS);
 
-					for (j = 0; j < terms[i].num_segment_refs; j++)
+					for (j = 0; j < tcount; j++)
 					{
-						int sref_idx = terms[i].segment_refs[j].segment_idx;
-						TpSegmentReader *rdr = sources[sref_idx].reader;
-						TpTenantDocFreq *sdf;
-						int				 sdf_count;
+						uint32			 tid = tpostings[j].tenant_id;
+						TpTenantDocFreq *e;
+						bool			 found;
 
-						/*
-						 * Find this term's index in the
-						 * source segment to read its tenant
-						 * docfreq.
-						 */
-						uint32 src_term_idx = sources[sref_idx].current_idx;
-						/*
-						 * Note: current_idx has already
-						 * advanced past this term. We need
-						 * the original index. Unfortunately
-						 * merge_source_advance has moved it.
-						 * The dict_entry was captured in the
-						 * segment_ref. We can find the term
-						 * index by searching the source's
-						 * dictionary. But this is expensive.
-						 *
-						 * Alternative: store term_idx in
-						 * TpTermSegmentRef. But that would
-						 * change the struct.
-						 *
-						 * Simplest: recompute from postings
-						 * we already collected. Actually the
-						 * CollectedPosting has source_idx and
-						 * old_doc_id but no tenant_id.
-						 *
-						 * The cleanest approach: skip
-						 * per-term tenant docfreq merge for
-						 * now and just write empty entries.
-						 * The segment still has tenant_stats
-						 * for corpus-level stats, and the
-						 * read path falls back to global
-						 * doc_freq for V3/no-data terms.
-						 */
-						(void)rdr;
-						(void)sdf;
-						(void)sdf_count;
-						(void)src_term_idx;
+						if (tid == 0)
+							continue;
+
+						e = hash_search(tht, &tid, HASH_ENTER, &found);
+						if (!found)
+						{
+							e->tenant_id = tid;
+							e->doc_freq	 = 1;
+						}
+						else
+							e->doc_freq++;
 					}
 
-					/*
-					 * For now: no per-term merge (would
-					 * require storing source term index).
-					 * Merged segments produce empty
-					 * tenant_docfreq entries; scoring falls
-					 * back to global doc_freq.
-					 */
-					merged_tdf[i].entries = NULL;
-					merged_tdf[i].count	  = 0;
+					if (tpostings)
+						pfree(tpostings);
+
+					{
+						int				 n = hash_get_num_entries(tht);
+						HASH_SEQ_STATUS	 seq;
+						TpTenantDocFreq *e;
+						int				 idx = 0;
+
+						merged_tdf[i].count = (uint32)n;
+						if (n > 0)
+						{
+							merged_tdf[i].entries = palloc(
+									n * sizeof(TpTenantDocFreq));
+							hash_seq_init(&seq, tht);
+							while ((e = hash_seq_search(&seq)) != NULL)
+								merged_tdf[i].entries[idx++] = *e;
+							qsort(merged_tdf[i].entries,
+								  n,
+								  sizeof(TpTenantDocFreq),
+								  merge_compare_tenant_docfreq);
+						}
+					}
 
 					hash_destroy(tht);
 
 					tdf_offsets[i] = cur_offset;
-					cur_offset += sizeof(uint32);
+					cur_offset += sizeof(uint32) +
+								  merged_tdf[i].count *
+										  sizeof(TpTenantDocFreq);
 				}
 
 				/* Write offsets array */
@@ -1525,6 +1480,7 @@ write_merged_segment(
 	existing_header->data_size			   = header.data_size;
 	existing_header->num_pages			   = header.num_pages;
 	existing_header->page_index			   = header.page_index;
+	existing_header->tenant_map_offset	   = header.tenant_map_offset;
 	existing_header->tenant_stats_offset   = header.tenant_stats_offset;
 	existing_header->tenant_docfreq_offset = header.tenant_docfreq_offset;
 	existing_header->flags				   = header.flags;

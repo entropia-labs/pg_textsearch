@@ -1407,6 +1407,9 @@ tp_merge_worker_buffers_to_segment(
 			block_postings[j].frequency = postings[j].frequency;
 			block_postings[j].fieldnorm = norm;
 			block_postings[j].reserved	= 0;
+
+			if (has_tenant_data && postings[j].tenant_id != 0)
+				tp_docmap_set_tenant_id(docmap, doc_id, postings[j].tenant_id);
 		}
 
 		/* Write posting blocks and build skip entries */
@@ -1518,6 +1521,17 @@ tp_merge_worker_buffers_to_segment(
 	{
 		tp_segment_writer_write(
 				&writer, docmap->fieldnorms, docmap->num_docs * sizeof(uint8));
+	}
+
+	/* Write tenant_map section (uint32 per doc, V4) */
+	header.tenant_map_offset = 0;
+	if (has_tenant_data && docmap->num_docs > 0 && docmap->tenant_ids != NULL)
+	{
+		header.tenant_map_offset = writer.current_offset;
+		tp_segment_writer_write(
+				&writer,
+				docmap->tenant_ids,
+				docmap->num_docs * sizeof(uint32));
 	}
 
 	/*

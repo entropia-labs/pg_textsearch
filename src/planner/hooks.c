@@ -839,6 +839,14 @@ inject_tenant_predicate(Query *query, BM25OidCache *oids)
 		left  = linitial(opexpr->args);
 		right = lsecond(opexpr->args);
 
+		/* Fold FuncExpr (e.g. to_bm25query()) to Const */
+		if (IsA(right, FuncExpr))
+		{
+			right = eval_const_expressions(NULL, right);
+			if (IsA(right, Const))
+				lsecond(opexpr->args) = right;
+		}
+
 		if (!IsA(left, Var) || !IsA(right, Const))
 			continue;
 
@@ -910,6 +918,10 @@ resolve_indexes_in_query(Query *query)
 	 * Track if this query has BM25 operators for the planner hook.
 	 * This avoids expensive plan tree walks for non-BM25 queries.
 	 */
+	elog(DEBUG1,
+		 "resolve_indexes_in_query: found_bm25_operator=%d",
+		 context.found_bm25_operator);
+
 	if (context.found_bm25_operator)
 	{
 		query_has_bm25_operators = true;

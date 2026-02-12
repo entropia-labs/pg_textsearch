@@ -288,6 +288,10 @@ typedef struct TpSegmentReader
 	BlockNumber	 *cached_ctid_pages;   /* Page numbers (4 bytes/doc) */
 	OffsetNumber *cached_ctid_offsets; /* Tuple offsets (2 bytes/doc) */
 	uint32		  cached_num_docs;	   /* Number of docs cached */
+
+	/* Tenant map for segment-level tenant filtering (V4) */
+	uint32 *cached_tenant_ids; /* doc_id → tenant_id (lazy-loaded) */
+	bool	tenant_ids_loaded; /* True after first load attempt */
 } TpSegmentReader;
 
 /*
@@ -351,6 +355,12 @@ extern void tp_segment_close(TpSegmentReader *reader);
 extern void tp_segment_lookup_ctid(
 		TpSegmentReader *reader, uint32 doc_id, ItemPointerData *ctid_out);
 
+/* Load tenant_ids from segment (lazy, called on first access) */
+extern void tp_segment_load_tenant_ids(TpSegmentReader *reader);
+
+/* Get tenant_id for a doc_id. Returns 0 if no tenant data. */
+extern uint32 tp_segment_get_tenant_id(TpSegmentReader *reader, uint32 doc_id);
+
 /* Zero-copy reader functions */
 typedef struct TpSegmentDirectAccess
 {
@@ -409,7 +419,8 @@ extern void tp_score_all_terms_in_segment_chain(
 		float4		k1,
 		float4		b,
 		float4		avg_doc_len,
-		void	   *doc_scores_hash);
+		void	   *doc_scores_hash,
+		uint32		tenant_id);
 
 /*
  * Segment posting iterator for block-based traversal.

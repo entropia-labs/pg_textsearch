@@ -845,12 +845,19 @@ score_term_postings(
 		float4					  k1,
 		float4					  b,
 		float4					  avg_doc_len,
-		HTAB					 *hash_table)
+		HTAB					 *hash_table,
+		uint32					  tenant_id)
 {
 	TpSegmentPosting *posting;
 
 	while (tp_segment_posting_iterator_next(iter, &posting))
 	{
+		/* Skip documents not matching tenant filter */
+		if (tenant_id != 0 &&
+			tp_segment_get_tenant_id(iter->reader, posting->doc_id) !=
+					tenant_id)
+			continue;
+
 		process_posting(
 				posting, idf, query_freq, k1, b, avg_doc_len, hash_table);
 	}
@@ -870,7 +877,8 @@ score_segment_for_all_terms(
 		float4			 k1,
 		float4			 b,
 		float4			 avg_doc_len,
-		HTAB			*hash_table)
+		HTAB			*hash_table,
+		uint32			 tenant_id)
 {
 	for (int term_idx = 0; term_idx < term_count; term_idx++)
 	{
@@ -894,7 +902,8 @@ score_segment_for_all_terms(
 				k1,
 				b,
 				avg_doc_len,
-				hash_table);
+				hash_table,
+				tenant_id);
 
 		tp_segment_posting_iterator_free(&iter);
 	}
@@ -912,7 +921,8 @@ tp_score_all_terms_in_segment_chain(
 		float4		k1,
 		float4		b,
 		float4		avg_doc_len,
-		void	   *doc_scores_hash)
+		void	   *doc_scores_hash,
+		uint32		tenant_id)
 {
 	BlockNumber current	   = first_segment;
 	HTAB	   *hash_table = (HTAB *)doc_scores_hash;
@@ -938,7 +948,8 @@ tp_score_all_terms_in_segment_chain(
 				k1,
 				b,
 				avg_doc_len,
-				hash_table);
+				hash_table,
+				tenant_id);
 
 		current = reader->header->next_segment;
 		tp_segment_close(reader);

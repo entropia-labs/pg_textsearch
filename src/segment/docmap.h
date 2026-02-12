@@ -47,6 +47,7 @@ typedef struct TpDocMapBuilder
 	BlockNumber	 *ctid_pages;	/* doc_id → page number (4 bytes) */
 	OffsetNumber *ctid_offsets; /* doc_id → tuple offset (2 bytes) */
 	uint8		 *fieldnorms;	/* doc_id → encoded length (1 byte) */
+	uint32		 *tenant_ids;	/* doc_id → tenant_id (4 bytes, or NULL) */
 } TpDocMapBuilder;
 
 /*
@@ -81,6 +82,24 @@ extern void tp_docmap_finalize(TpDocMapBuilder *builder);
  * Free the document map builder and all associated memory.
  */
 extern void tp_docmap_destroy(TpDocMapBuilder *builder);
+
+/*
+ * Set the tenant_id for a doc_id. Call AFTER finalize, since finalize
+ * reassigns doc_ids. Allocates tenant_ids array on first call.
+ */
+extern void tp_docmap_set_tenant_id(
+		TpDocMapBuilder *builder, uint32 doc_id, uint32 tenant_id);
+
+/*
+ * Get the tenant_id for a doc_id. Returns 0 if tenant_ids is NULL.
+ */
+static inline uint32
+tp_docmap_get_tenant_id(TpDocMapBuilder *builder, uint32 doc_id)
+{
+	if (builder->tenant_ids == NULL || doc_id >= builder->num_docs)
+		return 0;
+	return builder->tenant_ids[doc_id];
+}
 
 /*
  * Get the CTID for a doc_id. Requires finalize to have been called.

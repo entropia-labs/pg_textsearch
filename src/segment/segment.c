@@ -303,6 +303,8 @@ tp_segment_open_ex(Relation index, BlockNumber root_block, bool load_ctids)
 	reader->cached_ctid_pages	= NULL;
 	reader->cached_ctid_offsets = NULL;
 	reader->cached_num_docs		= 0;
+	reader->cached_tenant_ids	= NULL;
+	reader->tenant_ids_loaded	= false;
 
 	if (load_ctids && header->num_docs > 0 && header->ctid_pages_offset > 0)
 	{
@@ -325,6 +327,9 @@ tp_segment_open_ex(Relation index, BlockNumber root_block, bool load_ctids)
 				header->ctid_offsets_offset,
 				reader->cached_ctid_offsets,
 				header->num_docs * sizeof(OffsetNumber));
+
+		/* Eager-load tenant_ids when CTIDs are preloaded */
+		tp_segment_load_tenant_ids(reader);
 	}
 
 	return reader;
@@ -383,6 +388,50 @@ tp_segment_lookup_ctid(
 	ItemPointerSet(ctid_out, page, offset);
 }
 
+/*
+ * Load tenant_ids array from V4 segment tenant_map section.
+ * No-op if already loaded or segment has no tenant data.
+ */
+void
+tp_segment_load_tenant_ids(TpSegmentReader *reader)
+{
+	TpSegmentHeader *header;
+
+	if (reader->tenant_ids_loaded)
+		return;
+
+	reader->tenant_ids_loaded = true;
+	header					  = reader->header;
+
+	if (header->num_docs == 0 || header->tenant_map_offset == 0 ||
+		!(header->flags & TP_FLAG_HAS_TENANT_DATA))
+		return;
+
+	reader->cached_tenant_ids = palloc(header->num_docs * sizeof(uint32));
+	tp_segment_read(
+			reader,
+			header->tenant_map_offset,
+			reader->cached_tenant_ids,
+			header->num_docs * sizeof(uint32));
+}
+
+/*
+ * Get tenant_id for a doc_id. Lazy-loads tenant_ids on first call.
+ * Returns 0 if no tenant data or doc_id out of range.
+ */
+uint32
+tp_segment_get_tenant_id(TpSegmentReader *reader, uint32 doc_id)
+{
+	if (!reader->tenant_ids_loaded)
+		tp_segment_load_tenant_ids(reader);
+
+	if (reader->cached_tenant_ids == NULL ||
+		doc_id >= reader->header->num_docs)
+		return 0;
+
+	return reader->cached_tenant_ids[doc_id];
+}
+
 void
 tp_segment_close(TpSegmentReader *reader)
 {
@@ -406,6 +455,8 @@ tp_segment_close(TpSegmentReader *reader)
 		pfree(reader->cached_ctid_pages);
 	if (reader->cached_ctid_offsets)
 		pfree(reader->cached_ctid_offsets);
+	if (reader->cached_tenant_ids)
+		pfree(reader->cached_tenant_ids);
 
 	pfree(reader);
 }
@@ -1185,6 +1236,10 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 				block_postings[j].frequency = (uint16)entries[j].frequency;
 				block_postings[j].fieldnorm = norm;
 				block_postings[j].reserved	= 0;
+
+				if (has_tenant_data && entries[j].tenant_id != 0)
+					tp_docmap_set_tenant_id(
+							docmap, doc_id, entries[j].tenant_id);
 			}
 		}
 
@@ -1296,6 +1351,17 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 				&writer,
 				docmap->ctid_offsets,
 				docmap->num_docs * sizeof(OffsetNumber));
+	}
+
+	/* Write tenant_map section (uint32 per doc, V4) */
+	header.tenant_map_offset = 0;
+	if (has_tenant_data && docmap->num_docs > 0 && docmap->tenant_ids != NULL)
+	{
+		header.tenant_map_offset = writer.current_offset;
+		tp_segment_writer_write(
+				&writer,
+				docmap->tenant_ids,
+				docmap->num_docs * sizeof(uint32));
 	}
 
 	/* Update num_docs to actual count from this segment */
@@ -1553,6 +1619,7 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	existing_header->data_size			   = header.data_size;
 	existing_header->num_pages			   = header.num_pages;
 	existing_header->page_index			   = header.page_index;
+	existing_header->tenant_map_offset	   = header.tenant_map_offset;
 	existing_header->tenant_stats_offset   = header.tenant_stats_offset;
 	existing_header->tenant_docfreq_offset = header.tenant_docfreq_offset;
 	existing_header->flags				   = header.flags;

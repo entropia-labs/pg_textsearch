@@ -67,6 +67,7 @@ tp_docmap_create(void)
 	builder->ctid_pages	  = NULL;
 	builder->ctid_offsets = NULL;
 	builder->fieldnorms	  = NULL;
+	builder->tenant_ids	  = NULL;
 
 	return builder;
 }
@@ -205,6 +206,20 @@ tp_docmap_finalize(TpDocMapBuilder *builder)
 }
 
 void
+tp_docmap_set_tenant_id(
+		TpDocMapBuilder *builder, uint32 doc_id, uint32 tenant_id)
+{
+	Assert(builder->finalized);
+	Assert(doc_id < builder->num_docs);
+
+	/* Lazy-allocate tenant_ids array on first call */
+	if (builder->tenant_ids == NULL)
+		builder->tenant_ids = palloc0(builder->num_docs * sizeof(uint32));
+
+	builder->tenant_ids[doc_id] = tenant_id;
+}
+
+void
 tp_docmap_destroy(TpDocMapBuilder *builder)
 {
 	if (builder == NULL)
@@ -221,6 +236,9 @@ tp_docmap_destroy(TpDocMapBuilder *builder)
 
 	if (builder->fieldnorms)
 		pfree(builder->fieldnorms);
+
+	if (builder->tenant_ids)
+		pfree(builder->tenant_ids);
 
 	pfree(builder);
 }

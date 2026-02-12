@@ -478,7 +478,8 @@ score_segment_single_term_bmw(
 		float4			 k1,
 		float4			 b,
 		float4			 avg_doc_len,
-		TpBMWStats		*stats)
+		TpBMWStats		*stats,
+		uint32			 tenant_id)
 {
 	TpSegmentPostingIterator iter;
 	TpSegmentPosting		*posting;
@@ -538,6 +539,11 @@ score_segment_single_term_bmw(
 			 */
 			if (iter.current_block != i)
 				break;
+
+			/* Skip documents not matching tenant filter */
+			if (tenant_id != 0 &&
+				tp_segment_get_tenant_id(reader, posting->doc_id) != tenant_id)
+				continue;
 
 			score = compute_bm25_score(
 					idf,
@@ -618,7 +624,15 @@ tp_score_single_term_bmw(
 			TpSegmentReader *reader = tp_segment_open(index, seg_head);
 
 			score_segment_single_term_bmw(
-					&heap, reader, term, idf, k1, b, avg_doc_len, stats);
+					&heap,
+					reader,
+					term,
+					idf,
+					k1,
+					b,
+					avg_doc_len,
+					stats,
+					tenant_id);
 
 			seg_head = reader->header->next_segment;
 			tp_segment_close(reader);
@@ -1346,7 +1360,8 @@ score_segment_multi_term_bmw(
 		float4			 k1,
 		float4			 b,
 		float4			 avg_doc_len,
-		TpBMWStats		*stats)
+		TpBMWStats		*stats,
+		uint32			 tenant_id)
 {
 	int active_count;
 
@@ -1404,7 +1419,24 @@ score_segment_multi_term_bmw(
 		if (!verify_pivot_alignment(terms, pivot_len, pivot_doc_id))
 			continue; /* Re-pivot with new positions */
 
-		/* Step 5: Score the pivot document */
+		/* Step 5: Check tenant filter before scoring */
+		if (tenant_id != 0 &&
+			tp_segment_get_tenant_id(reader, pivot_doc_id) != tenant_id)
+		{
+			/* Wrong tenant - advance all pivot terms past pivot */
+			for (i = pivot_len - 1; i >= 0; i--)
+			{
+				if (term_current_doc_id(&terms[i]) == pivot_doc_id)
+				{
+					if (!advance_term_iterator(&terms[i]))
+						active_count--;
+					restore_ordering(terms, term_count, i);
+				}
+			}
+			continue;
+		}
+
+		/* Step 6: Score the pivot document */
 		doc_score = score_pivot_document(terms, pivot_len, k1, b, avg_doc_len);
 
 		if (doc_score > 0.0f && !tp_topk_dominated(heap, doc_score))
@@ -1415,7 +1447,7 @@ score_segment_multi_term_bmw(
 			stats->segment_docs_scored++;
 
 		/*
-		 * Step 6: Advance all pivot terms past pivot_doc_id.
+		 * Step 7: Advance all pivot terms past pivot_doc_id.
 		 * Iterate backward so restore_ordering shifts don't
 		 * skip any terms.
 		 */
@@ -1512,7 +1544,8 @@ tp_score_multi_term_bmw(
 					k1,
 					b,
 					avg_doc_len,
-					stats);
+					stats,
+					tenant_id);
 
 			seg_head = reader->header->next_segment;
 			tp_segment_close(reader);
