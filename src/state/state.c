@@ -204,6 +204,11 @@ tp_get_local_index_state(Oid index_oid)
 		 * the memtable's tenant_stats_handle may be INVALID if no
 		 * backend has loaded the stats since the last memtable clear.
 		 * The authoritative tenant stats are on disk in metapages.
+		 *
+		 * We take the per-index exclusive lock around the
+		 * check-and-create to prevent two backends from racing to
+		 * create separate dshash tables (which would leak the
+		 * first allocation).
 		 */
 		{
 			TpMemtable *memtable = get_memtable(local_state);
@@ -211,21 +216,29 @@ tp_get_local_index_state(Oid index_oid)
 			if (memtable &&
 				memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
 			{
-				Relation		index_rel;
-				TpIndexMetaPage metap;
+				tp_acquire_index_lock(local_state, LW_EXCLUSIVE);
 
-				index_rel = index_open(index_oid, AccessShareLock);
-				metap	  = tp_get_metapage(index_rel);
-
-				if (metap && metap->tenant_column_attno != 0 &&
-					metap->first_tenant_stats_page != InvalidBlockNumber)
+				/* Re-check under lock */
+				if (memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
 				{
-					tp_read_tenant_stats_pages(index_rel, local_state);
+					Relation		index_rel;
+					TpIndexMetaPage metap;
+
+					index_rel = index_open(index_oid, AccessShareLock);
+					metap	  = tp_get_metapage(index_rel);
+
+					if (metap && metap->tenant_column_attno != 0 &&
+						metap->first_tenant_stats_page != InvalidBlockNumber)
+					{
+						tp_read_tenant_stats_pages(index_rel, local_state);
+					}
+
+					if (metap)
+						pfree(metap);
+					index_close(index_rel, AccessShareLock);
 				}
 
-				if (metap)
-					pfree(metap);
-				index_close(index_rel, AccessShareLock);
+				tp_release_index_lock(local_state);
 			}
 		}
 
@@ -596,45 +609,44 @@ tp_finalize_build_mode(TpLocalIndexState *local_state)
 	{
 		HASH_SEQ_STATUS			 seq;
 		TpLocalTenantStatsEntry *local_entry;
+		dshash_table			*table = NULL;
+
+		/* Create the dshash once before the loop */
+		if (memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
+			memtable->tenant_stats_handle = tp_tenant_stats_create(global_dsa);
+
+		/* Attach once for all entries */
+		table = tp_tenant_stats_attach(
+				global_dsa, memtable->tenant_stats_handle);
 
 		hash_seq_init(&seq, build_tenant_stats_accum);
 		while ((local_entry = (TpLocalTenantStatsEntry *)hash_seq_search(
 						&seq)) != NULL)
 		{
-			/*
-			 * Create the tenant stats dshash if needed
-			 * and insert each accumulated entry.
-			 */
-			if (memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
-			{
-				memtable->tenant_stats_handle = tp_tenant_stats_create(
-						global_dsa);
-			}
+			TpTenantStatsEntry *entry;
+			bool				found;
 
-			{
-				dshash_table	   *table;
-				TpTenantStatsEntry *entry;
-				bool				found;
+			if (!table)
+				break;
 
-				table = tp_tenant_stats_attach(
-						global_dsa, memtable->tenant_stats_handle);
-				entry = (TpTenantStatsEntry *)dshash_find_or_insert(
-						table, &local_entry->tenant_id, &found);
-				if (!found)
-				{
-					entry->tenant_id = local_entry->tenant_id;
-					entry->doc_count = local_entry->doc_count;
-					entry->total_len = local_entry->total_len;
-				}
-				else
-				{
-					entry->doc_count += local_entry->doc_count;
-					entry->total_len += local_entry->total_len;
-				}
-				dshash_release_lock(table, entry);
-				dshash_detach(table);
+			entry = (TpTenantStatsEntry *)dshash_find_or_insert(
+					table, &local_entry->tenant_id, &found);
+			if (!found)
+			{
+				entry->tenant_id = local_entry->tenant_id;
+				entry->doc_count = local_entry->doc_count;
+				entry->total_len = local_entry->total_len;
 			}
+			else
+			{
+				entry->doc_count += local_entry->doc_count;
+				entry->total_len += local_entry->total_len;
+			}
+			dshash_release_lock(table, entry);
 		}
+
+		if (table)
+			dshash_detach(table);
 
 		hash_destroy(build_tenant_stats_accum);
 		build_tenant_stats_accum = NULL;
@@ -1407,6 +1419,14 @@ tp_clear_memtable(TpLocalIndexState *local_state)
 
 		/* Reset posting count */
 		memtable->total_postings = 0;
+
+		/*
+		 * Note: tenant_stats_handle is intentionally preserved.
+		 * Tenant stats are cumulative corpus-level statistics
+		 * (doc_count, total_len per tenant) that must survive
+		 * across memtable spills.  They are only rebuilt from
+		 * disk on first attach or after a full index rebuild.
+		 */
 
 		/* Try to reclaim DSA memory (best effort) */
 		dsa_trim(local_state->dsa);

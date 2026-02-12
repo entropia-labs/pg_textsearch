@@ -535,7 +535,16 @@ score_segment_single_term_bmw(
 				continue;
 			}
 
-			/* Skip single-tenant block belonging to other tenant */
+			/*
+			 * Skip single-tenant block belonging to other tenant.
+			 *
+			 * The skip entry stores only the lower 16 bits of the
+			 * tenant_id.  A mismatch guarantees different tenants
+			 * (safe to skip).  A match is only conclusive when the
+			 * full tenant_id fits in 16 bits; for tenant_id > 0xFFFF
+			 * a match is ambiguous so we fall through to per-doc
+			 * filtering.
+			 */
 			if (tenant_id != 0 &&
 				skip_entries[i].reserved[0] == TP_TENANT_MODE_SINGLE)
 			{

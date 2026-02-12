@@ -398,10 +398,25 @@ tp_get_tenant_doc_freq(
 			uint32 seg_df = tp_segment_get_tenant_doc_freq(
 					index, level_heads[level], term, tenant_id, &has_v4);
 			if (seg_df > 0)
+			{
 				doc_freq += seg_df;
+			}
 			else if (!has_v4)
+			{
+				/*
+				 * V3 segment: no per-tenant doc_freq available.
+				 * Fall back to global doc_freq which inflates
+				 * IDF for tenant-scoped queries.  Expected
+				 * during V3→V4 migration.
+				 */
+				elog(DEBUG2,
+					 "tenant %u: using global doc_freq "
+					 "fallback for V3 segment at L%d",
+					 tenant_id,
+					 level);
 				doc_freq += tp_segment_get_doc_freq(
 						index, level_heads[level], term);
+			}
 		}
 	}
 

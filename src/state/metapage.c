@@ -553,12 +553,17 @@ tp_write_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
 /*
  * Read per-tenant statistics from disk and restore into
  * the dshash table in shared memory.
+ *
+ * The caller must hold the per-index exclusive lock to
+ * prevent two backends from racing to create the dshash.
  */
 void
 tp_read_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
 {
 	TpIndexMetaPage metap;
 	BlockNumber		current_page;
+	TpMemtable	   *memtable;
+	dshash_table   *table = NULL;
 
 	metap = tp_get_metapage(index);
 	if (!metap)
@@ -566,6 +571,21 @@ tp_read_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
 
 	current_page = metap->first_tenant_stats_page;
 	pfree(metap);
+
+	memtable = get_memtable(local_state);
+	if (!memtable)
+		return;
+
+	/* Create the dshash once before iterating pages */
+	if (memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
+		memtable->tenant_stats_handle = tp_tenant_stats_create(
+				local_state->dsa);
+
+	/* Attach once for all entries */
+	table = tp_tenant_stats_attach(
+			local_state->dsa, memtable->tenant_stats_handle);
+	if (!table)
+		return;
 
 	while (current_page != InvalidBlockNumber)
 	{
@@ -582,6 +602,13 @@ tp_read_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
 		header = (TpTenantStatsPageHeader *)PageGetContents(page);
 		if (header->magic != TP_TENANT_STATS_PAGE_MAGIC)
 		{
+			elog(WARNING,
+				 "tenant stats page %u has invalid magic "
+				 "number 0x%08X (expected 0x%08X), "
+				 "stopping stats load",
+				 current_page,
+				 header->magic,
+				 TP_TENANT_STATS_PAGE_MAGIC);
 			UnlockReleaseBuffer(buf);
 			break;
 		}
@@ -593,25 +620,8 @@ tp_read_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
 		for (i = 0; i < header->num_entries; i++)
 		{
 			TpTenantStatsEntry *e = &page_entries[i];
-			TpMemtable		   *memtable;
-			dshash_table	   *table;
 			TpTenantStatsEntry *dst;
 			bool				found;
-
-			memtable = get_memtable(local_state);
-			if (!memtable)
-				break;
-
-			if (memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
-			{
-				memtable->tenant_stats_handle = tp_tenant_stats_create(
-						local_state->dsa);
-			}
-
-			table = tp_tenant_stats_attach(
-					local_state->dsa, memtable->tenant_stats_handle);
-			if (!table)
-				break;
 
 			dst = (TpTenantStatsEntry *)
 					dshash_find_or_insert(table, &e->tenant_id, &found);
@@ -627,10 +637,11 @@ tp_read_tenant_stats_pages(Relation index, TpLocalIndexState *local_state)
 				dst->total_len += e->total_len;
 			}
 			dshash_release_lock(table, dst);
-			dshash_detach(table);
 		}
 
 		current_page = header->next_page;
 		UnlockReleaseBuffer(buf);
 	}
+
+	dshash_detach(table);
 }
