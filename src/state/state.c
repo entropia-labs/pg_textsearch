@@ -1511,8 +1511,22 @@ tp_bulk_load_spill_check(void)
 
 			metap->level_heads[0] = segment_root;
 			metap->level_counts[0]++;
-			MarkBufferDirty(metabuf);
-			UnlockReleaseBuffer(metabuf);
+
+			/* Persist corpus stats for crash recovery */
+			metap->total_docs = local_state->shared->total_docs;
+			metap->total_len  = local_state->shared->total_len;
+
+			{
+				uint32 tenant_attno = metap->tenant_column_attno;
+
+				MarkBufferDirty(metabuf);
+				FlushOneBuffer(metabuf);
+				UnlockReleaseBuffer(metabuf);
+
+				/* Persist tenant stats if configured */
+				if (tenant_attno != 0)
+					tp_write_tenant_stats_pages(index_rel, local_state);
+			}
 
 			elog(DEBUG2,
 				 "Bulk load spilled memtable to segment at block %u "

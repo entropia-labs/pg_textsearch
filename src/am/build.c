@@ -127,8 +127,22 @@ tp_auto_spill_if_needed(TpLocalIndexState *index_state, Relation index_rel)
 
 		metap->level_heads[0] = segment_root;
 		metap->level_counts[0]++;
-		MarkBufferDirty(metabuf);
-		UnlockReleaseBuffer(metabuf);
+
+		/* Persist corpus stats for crash recovery */
+		metap->total_docs = index_state->shared->total_docs;
+		metap->total_len  = index_state->shared->total_len;
+
+		{
+			uint32 tenant_attno = metap->tenant_column_attno;
+
+			MarkBufferDirty(metabuf);
+			FlushOneBuffer(metabuf);
+			UnlockReleaseBuffer(metabuf);
+
+			/* Persist tenant stats if configured */
+			if (tenant_attno != 0)
+				tp_write_tenant_stats_pages(index_rel, index_state);
+		}
 
 		/* Check if L0 needs compaction */
 		pgstat_progress_update_param(
@@ -220,9 +234,22 @@ tp_spill_memtable(PG_FUNCTION_ARGS)
 
 		metap->level_heads[0] = segment_root;
 		metap->level_counts[0]++;
-		MarkBufferDirty(metabuf);
 
-		UnlockReleaseBuffer(metabuf);
+		/* Persist corpus stats for crash recovery */
+		metap->total_docs = index_state->shared->total_docs;
+		metap->total_len  = index_state->shared->total_len;
+
+		{
+			uint32 tenant_attno = metap->tenant_column_attno;
+
+			MarkBufferDirty(metabuf);
+			FlushOneBuffer(metabuf);
+			UnlockReleaseBuffer(metabuf);
+
+			/* Persist tenant stats if configured */
+			if (tenant_attno != 0)
+				tp_write_tenant_stats_pages(index_rel, index_state);
+		}
 
 		/* Check if L0 needs compaction */
 		tp_maybe_compact_level(index_rel, 0);
