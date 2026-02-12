@@ -1439,7 +1439,38 @@ tp_merge_worker_buffers_to_segment(
 			skip.block_max_tf	= max_tf;
 			skip.block_max_norm = max_norm;
 			skip.posting_offset = writer.current_offset;
-			memset(skip.reserved, 0, sizeof(skip.reserved));
+			skip.reserved[0]	= TP_TENANT_MODE_NONE;
+			skip.reserved[1]	= 0;
+			skip.reserved[2]	= 0;
+
+			/* Compute per-block tenant_mode for V4 */
+			if (has_tenant_data && docmap->tenant_ids != NULL)
+			{
+				uint32 first_tid =
+						docmap->tenant_ids[block_postings[block_start].doc_id];
+				bool all_same = true;
+
+				for (j = block_start + 1; j < block_end; j++)
+				{
+					if (docmap->tenant_ids[block_postings[j].doc_id] !=
+						first_tid)
+					{
+						all_same = false;
+						break;
+					}
+				}
+
+				if (first_tid != 0 && all_same)
+				{
+					skip.reserved[0] = TP_TENANT_MODE_SINGLE;
+					skip.reserved[1] = (uint8)(first_tid & 0xFF);
+					skip.reserved[2] = (uint8)((first_tid >> 8) & 0xFF);
+				}
+				else if (!all_same)
+				{
+					skip.reserved[0] = TP_TENANT_MODE_MIXED;
+				}
+			}
 
 			/* Write posting block data (compressed or uncompressed) */
 			if (tp_compress_segments)

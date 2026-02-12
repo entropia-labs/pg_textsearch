@@ -149,6 +149,25 @@ tp_get_tenant_stats(
 }
 
 /*
+ * Check if the tenant stats infrastructure is initialized.
+ * Returns true if the memtable exists and has a valid dshash
+ * handle, meaning tenant stats are being tracked.
+ */
+bool
+tp_tenant_stats_initialized(TpLocalIndexState *local_state)
+{
+	TpMemtable *memtable;
+
+	Assert(local_state != NULL);
+
+	memtable = get_memtable(local_state);
+	if (!memtable)
+		return false;
+
+	return memtable->tenant_stats_handle != DSHASH_HANDLE_INVALID;
+}
+
+/*
  * Collect all tenant stats entries into a palloc'd array.
  * Returns the number of entries. Caller must pfree.
  */

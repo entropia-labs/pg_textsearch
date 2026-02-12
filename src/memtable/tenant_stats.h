@@ -62,6 +62,13 @@ extern dshash_table *
 tp_tenant_stats_attach(dsa_area *area, dshash_table_handle handle);
 
 /*
+ * Check if the tenant stats infrastructure is initialized
+ * (i.e., the dshash table exists in shared memory). Returns
+ * true if stats are available, false for pre-tenant indexes.
+ */
+extern bool tp_tenant_stats_initialized(TpLocalIndexState *local_state);
+
+/*
  * Iterate all tenant stats entries and collect them into an
  * array. Returns the number of entries collected. The caller
  * must pfree the returned array.

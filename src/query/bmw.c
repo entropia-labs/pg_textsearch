@@ -496,72 +496,95 @@ score_segment_single_term_bmw(
 	dict_entry	= &iter.dict_entry;
 	block_count = dict_entry->block_count;
 
-	/* Pre-compute block max scores */
-	block_max_scores = palloc(block_count * sizeof(float4));
-	for (i = 0; i < block_count; i++)
+	/* Pre-compute block max scores and cache skip entries */
 	{
-		TpSkipEntry skip;
-		tp_segment_read_skip_entry(reader, dict_entry, i, &skip);
-		block_max_scores[i] =
-				tp_compute_block_max_score(&skip, idf, k1, b, avg_doc_len);
-	}
+		TpSkipEntry *skip_entries;
 
-	/* Process blocks with BMW */
-	for (i = 0; i < block_count; i++)
-	{
-		float4 threshold = tp_topk_threshold(heap);
-		float4 block_max = block_max_scores[i];
+		block_max_scores = palloc(block_count * sizeof(float4));
+		skip_entries	 = palloc(block_count * sizeof(TpSkipEntry));
 
-		/* Skip block if it can't beat threshold */
-		if (block_max < threshold)
+		for (i = 0; i < block_count; i++)
 		{
-			if (stats)
-				stats->blocks_skipped++;
-			continue;
+			tp_segment_read_skip_entry(
+					reader, dict_entry, i, &skip_entries[i]);
+			block_max_scores[i] = tp_compute_block_max_score(
+					&skip_entries[i], idf, k1, b, avg_doc_len);
 		}
 
-		if (stats)
-			stats->blocks_scanned++;
-
-		/* Load and score this block */
-		iter.current_block = i;
-		iter.finished	   = false; /* Reset so we can process this block */
-		tp_segment_posting_iterator_load_block(&iter);
-
-		while (tp_segment_posting_iterator_next(&iter, &posting))
+		/* Process blocks with BMW */
+		for (i = 0; i < block_count; i++)
 		{
-			float4 score;
+			float4 threshold = tp_topk_threshold(heap);
+			float4 block_max = block_max_scores[i];
 
-			/*
-			 * Break if iterator auto-advanced to next block.
-			 * This ensures we only process block i, allowing the outer
-			 * for loop to apply threshold checks to subsequent blocks.
-			 */
-			if (iter.current_block != i)
-				break;
-
-			/* Skip documents not matching tenant filter */
-			if (tenant_id != 0 &&
-				tp_segment_get_tenant_id(reader, posting->doc_id) != tenant_id)
-				continue;
-
-			score = compute_bm25_score(
-					idf,
-					posting->frequency,
-					posting->doc_length,
-					k1,
-					b,
-					avg_doc_len);
-
-			if (!tp_topk_dominated(heap, score))
+			/* Skip block if it can't beat threshold */
+			if (block_max < threshold)
 			{
-				tp_topk_add_segment(
-						heap, reader->root_block, posting->doc_id, score);
+				if (stats)
+					stats->blocks_skipped++;
+				continue;
+			}
+
+			/* Skip single-tenant block belonging to other tenant */
+			if (tenant_id != 0 &&
+				skip_entries[i].reserved[0] == TP_TENANT_MODE_SINGLE)
+			{
+				uint16 block_tid = (uint16)skip_entries[i].reserved[1] |
+								   ((uint16)skip_entries[i].reserved[2] << 8);
+				if (block_tid != (uint16)(tenant_id & 0xFFFF))
+				{
+					if (stats)
+						stats->blocks_skipped++;
+					continue;
+				}
 			}
 
 			if (stats)
-				stats->segment_docs_scored++;
+				stats->blocks_scanned++;
+
+			/* Load and score this block */
+			iter.current_block = i;
+			iter.finished	   = false;
+			tp_segment_posting_iterator_load_block(&iter);
+
+			while (tp_segment_posting_iterator_next(&iter, &posting))
+			{
+				float4 score;
+
+				/*
+				 * Break if iterator auto-advanced to next block.
+				 * This ensures we only process block i, allowing
+				 * the outer loop to apply threshold checks.
+				 */
+				if (iter.current_block != i)
+					break;
+
+				/* Skip docs not matching tenant filter */
+				if (tenant_id != 0 &&
+					tp_segment_get_tenant_id(reader, posting->doc_id) !=
+							tenant_id)
+					continue;
+
+				score = compute_bm25_score(
+						idf,
+						posting->frequency,
+						posting->doc_length,
+						k1,
+						b,
+						avg_doc_len);
+
+				if (!tp_topk_dominated(heap, score))
+				{
+					tp_topk_add_segment(
+							heap, reader->root_block, posting->doc_id, score);
+				}
+
+				if (stats)
+					stats->segment_docs_scored++;
+			}
 		}
+
+		pfree(skip_entries);
 	}
 
 	pfree(block_max_scores);
@@ -1423,15 +1446,52 @@ score_segment_multi_term_bmw(
 		if (tenant_id != 0 &&
 			tp_segment_get_tenant_id(reader, pivot_doc_id) != tenant_id)
 		{
-			/* Wrong tenant - advance all pivot terms past pivot */
+			/*
+			 * Wrong tenant. For each pivot term, check if its
+			 * current block is single-tenant non-matching. If
+			 * so, skip to end of block instead of advancing
+			 * one doc at a time.
+			 */
 			for (i = pivot_len - 1; i >= 0; i--)
 			{
-				if (term_current_doc_id(&terms[i]) == pivot_doc_id)
+				TpTermState *ts = &terms[i];
+				uint16		 blk;
+				bool		 did_skip = false;
+
+				if (term_current_doc_id(ts) != pivot_doc_id)
+					continue;
+
+				blk = ts->iter.current_block;
+				if (ts->found && !ts->iter.finished &&
+					ts->block_last_doc_ids != NULL &&
+					blk < ts->iter.dict_entry.block_count)
 				{
-					if (!advance_term_iterator(&terms[i]))
-						active_count--;
-					restore_ordering(terms, term_count, i);
+					TpSkipEntry skip;
+
+					tp_segment_read_skip_entry(
+							reader, &ts->iter.dict_entry, blk, &skip);
+					if (skip.reserved[0] == TP_TENANT_MODE_SINGLE)
+					{
+						uint16 btid = (uint16)skip.reserved[1] |
+									  ((uint16)skip.reserved[2] << 8);
+						if (btid != (uint16)(tenant_id & 0xFFFF))
+						{
+							uint32 target = ts->block_last_doc_ids[blk] + 1;
+							if (!seek_term_to_doc(ts, target))
+								active_count--;
+							did_skip = true;
+							if (stats)
+								stats->blocks_skipped++;
+						}
+					}
 				}
+
+				if (!did_skip)
+				{
+					if (!advance_term_iterator(ts))
+						active_count--;
+				}
+				restore_ordering(terms, term_count, i);
 			}
 			continue;
 		}

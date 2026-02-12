@@ -966,10 +966,14 @@ tp_segment_get_tenant_doc_freq(
 		Relation	index,
 		BlockNumber first_segment,
 		const char *term,
-		uint32		tenant_id)
+		uint32		tenant_id,
+		bool	   *has_v4_data)
 {
 	BlockNumber current	 = first_segment;
 	uint32		doc_freq = 0;
+
+	if (has_v4_data)
+		*has_v4_data = false;
 
 	while (current != InvalidBlockNumber)
 	{
@@ -989,6 +993,9 @@ tp_segment_get_tenant_doc_freq(
 			TpDictionary dict_header;
 			uint32		*string_offsets;
 			int			 left, right;
+
+			if (has_v4_data)
+				*has_v4_data = true;
 
 			tp_segment_read(
 					reader,
@@ -1240,11 +1247,13 @@ tp_batch_get_segment_tenant_doc_freq(
 					}
 
 					/*
-					 * Fallback: V3 segment or tenant not
-					 * found in V4 section — use global
-					 * doc_freq.
+					 * Fallback: only use global doc_freq
+					 * for V3 segments without tenant data.
+					 * When has_tdf is true (V4 segment),
+					 * the tenant genuinely has 0 docs for
+					 * this term — do NOT fall back.
 					 */
-					if (!found_tenant)
+					if (!found_tenant && !has_tdf)
 					{
 						TpDictEntry de;
 

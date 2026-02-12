@@ -488,7 +488,8 @@ extern uint32 tp_segment_get_tenant_doc_freq(
 		Relation	index,
 		BlockNumber first_segment,
 		const char *term,
-		uint32		tenant_id);
+		uint32		tenant_id,
+		bool	   *has_v4_data);
 
 /* Batch per-tenant doc_freq lookup for multiple terms */
 extern void tp_batch_get_segment_tenant_doc_freq(

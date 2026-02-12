@@ -394,11 +394,12 @@ tp_get_tenant_doc_freq(
 	{
 		if (level_heads[level] != InvalidBlockNumber)
 		{
+			bool   has_v4 = false;
 			uint32 seg_df = tp_segment_get_tenant_doc_freq(
-					index, level_heads[level], term, tenant_id);
+					index, level_heads[level], term, tenant_id, &has_v4);
 			if (seg_df > 0)
 				doc_freq += seg_df;
-			else
+			else if (!has_v4)
 				doc_freq += tp_segment_get_doc_freq(
 						index, level_heads[level], term);
 		}
@@ -563,13 +564,20 @@ tp_score_documents(
 
 		if (tp_get_tenant_stats(local_state, tenant_id, &t_docs, &t_len))
 		{
-			if (t_docs > 0)
-			{
-				total_docs	= t_docs;
-				avg_doc_len = (float4)(t_len / (double)t_docs);
-			}
+			if (t_docs == 0)
+				return 0; /* Tenant exists but has no docs */
+			total_docs	= t_docs;
+			avg_doc_len = (float4)(t_len / (double)t_docs);
 		}
-		/* If tenant not found, fall back to global stats */
+		else if (tp_tenant_stats_initialized(local_state))
+		{
+			/*
+			 * Tenant stats infrastructure exists but this
+			 * tenant is absent — it has zero documents.
+			 */
+			return 0;
+		}
+		/* Else: pre-tenant index, fall back to global stats */
 	}
 
 	/* If avg_doc_len is 0, all documents have zero length and
@@ -677,6 +685,25 @@ tp_score_documents(
 					query_term_count,
 					level_heads,
 					doc_freqs);
+
+		/* Early exit if all terms have zero doc_freq for tenant */
+		{
+			bool all_zero = true;
+
+			for (i = 0; i < query_term_count; i++)
+			{
+				if (doc_freqs[i] > 0)
+				{
+					all_zero = false;
+					break;
+				}
+			}
+			if (all_zero)
+			{
+				pfree(doc_freqs);
+				return 0;
+			}
+		}
 
 		/* Convert doc_freqs to IDFs */
 		idfs = palloc(query_term_count * sizeof(float4));
