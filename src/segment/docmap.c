@@ -61,19 +61,26 @@ tp_docmap_create(void)
 			&hash_ctl,
 			HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 
-	builder->num_docs	  = 0;
-	builder->capacity	  = 0;
-	builder->finalized	  = false;
-	builder->ctid_pages	  = NULL;
-	builder->ctid_offsets = NULL;
-	builder->fieldnorms	  = NULL;
-	builder->tenant_ids	  = NULL;
+	builder->num_docs		   = 0;
+	builder->capacity		   = 0;
+	builder->finalized		   = false;
+	builder->ctid_pages		   = NULL;
+	builder->ctid_offsets	   = NULL;
+	builder->fieldnorms		   = NULL;
+	builder->tenant_ids		   = NULL;
+	builder->tenant_ranges	   = NULL;
+	builder->num_tenant_ranges = 0;
+	builder->tenant_ordered	   = false;
 
 	return builder;
 }
 
 uint32
-tp_docmap_add(TpDocMapBuilder *builder, ItemPointer ctid, uint32 doc_length)
+tp_docmap_add(
+		TpDocMapBuilder *builder,
+		ItemPointer		 ctid,
+		uint32			 doc_length,
+		uint32			 tenant_id)
 {
 	TpDocMapEntry *entry;
 	bool		   found;
@@ -100,6 +107,7 @@ tp_docmap_add(TpDocMapBuilder *builder, ItemPointer ctid, uint32 doc_length)
 	/* New document - assign next sequential ID */
 	entry->doc_id	  = builder->num_docs;
 	entry->doc_length = doc_length;
+	entry->tenant_id  = tenant_id;
 	builder->num_docs++;
 
 	return entry->doc_id;
@@ -135,6 +143,25 @@ docmap_entry_cmp_by_ctid(const void *a, const void *b)
 	return ItemPointerCompare((ItemPointer)&ea->ctid, (ItemPointer)&eb->ctid);
 }
 
+/*
+ * Comparison function for sorting by (tenant_id, CTID).
+ * tenant_id=0 sorts first so non-tenant docs come before tenant docs.
+ * Within a tenant, docs are sorted by CTID for locality.
+ */
+static int
+docmap_entry_cmp_by_tenant_then_ctid(const void *a, const void *b)
+{
+	const TpDocMapEntry *ea = (const TpDocMapEntry *)a;
+	const TpDocMapEntry *eb = (const TpDocMapEntry *)b;
+
+	if (ea->tenant_id < eb->tenant_id)
+		return -1;
+	if (ea->tenant_id > eb->tenant_id)
+		return 1;
+
+	return ItemPointerCompare((ItemPointer)&ea->ctid, (ItemPointer)&eb->ctid);
+}
+
 void
 tp_docmap_finalize(TpDocMapBuilder *builder)
 {
@@ -142,6 +169,7 @@ tp_docmap_finalize(TpDocMapBuilder *builder)
 	TpDocMapEntry  *entry;
 	TpDocMapEntry  *entries;
 	uint32			i;
+	bool			has_tenants = false;
 
 	Assert(!builder->finalized);
 
@@ -158,47 +186,114 @@ tp_docmap_finalize(TpDocMapBuilder *builder)
 	hash_seq_init(&scan, builder->ctid_to_id);
 	while ((entry = (TpDocMapEntry *)hash_seq_search(&scan)) != NULL)
 	{
-		entries[i++] = *entry;
+		entries[i] = *entry;
+		if (entry->tenant_id != 0)
+			has_tenants = true;
+		i++;
 	}
 
 	Assert(i == builder->num_docs);
 
 	/*
-	 * Sort by CTID to assign doc_ids in CTID order.
-	 * This maintains the invariant: CTID order = doc_id order.
-	 * Postings sorted by CTID will then be sorted by doc_id,
-	 * enabling sequential access to CTID arrays during iteration.
+	 * Sort order depends on tenant data:
+	 * - Non-tenant indexes: CTID order (original invariant)
+	 * - Tenant indexes: (tenant_id, CTID) order so each tenant's
+	 *   docs occupy a contiguous doc_id range, enabling O(K) BMW.
 	 */
-	qsort(entries,
-		  builder->num_docs,
-		  sizeof(TpDocMapEntry),
-		  docmap_entry_cmp_by_ctid);
+	if (has_tenants)
+	{
+		qsort(entries,
+			  builder->num_docs,
+			  sizeof(TpDocMapEntry),
+			  docmap_entry_cmp_by_tenant_then_ctid);
+		builder->tenant_ordered = true;
+	}
+	else
+	{
+		qsort(entries,
+			  builder->num_docs,
+			  sizeof(TpDocMapEntry),
+			  docmap_entry_cmp_by_ctid);
+		builder->tenant_ordered = false;
+	}
 
-	/* Allocate output arrays (split CTID storage for better cache locality) */
+	/* Allocate output arrays (split CTID storage for cache locality) */
 	builder->capacity	  = builder->num_docs;
 	builder->ctid_pages	  = palloc(sizeof(BlockNumber) * builder->num_docs);
 	builder->ctid_offsets = palloc(sizeof(OffsetNumber) * builder->num_docs);
 	builder->fieldnorms	  = palloc(sizeof(uint8) * builder->num_docs);
 
+	/* Allocate tenant_ids array if any tenant data exists */
+	if (has_tenants)
+		builder->tenant_ids = palloc(sizeof(uint32) * builder->num_docs);
+
 	/*
-	 * Fill arrays and reassign doc_ids in CTID order.
-	 * Update hash table entries so lookups return the correct new doc_id.
+	 * Fill arrays and reassign doc_ids in sorted order.
+	 * Update hash table entries so lookups return the correct doc_id.
 	 */
 	for (i = 0; i < builder->num_docs; i++)
 	{
 		TpDocMapEntry *hash_entry;
 
-		/* Array position i = doc_id i (CTID-sorted order) */
 		builder->ctid_pages[i]	 = ItemPointerGetBlockNumber(&entries[i].ctid);
 		builder->ctid_offsets[i] = ItemPointerGetOffsetNumber(
 				&entries[i].ctid);
 		builder->fieldnorms[i] = encode_fieldnorm(entries[i].doc_length);
+
+		if (builder->tenant_ids)
+			builder->tenant_ids[i] = entries[i].tenant_id;
 
 		/* Update hash table entry with new doc_id */
 		hash_entry = (TpDocMapEntry *)hash_search(
 				builder->ctid_to_id, &entries[i].ctid, HASH_FIND, NULL);
 		Assert(hash_entry != NULL);
 		hash_entry->doc_id = i;
+	}
+
+	/*
+	 * Compute tenant ranges by detecting boundaries in the sorted
+	 * array. Each contiguous run of the same tenant_id becomes one
+	 * TpDocMapTenantRange.
+	 */
+	if (has_tenants)
+	{
+		uint32				 range_cap = 16;
+		uint32				 range_cnt = 0;
+		TpDocMapTenantRange *ranges;
+		uint32				 run_start	= 0;
+		uint32				 run_tenant = entries[0].tenant_id;
+
+		ranges = palloc(range_cap * sizeof(TpDocMapTenantRange));
+
+		for (i = 1; i <= builder->num_docs; i++)
+		{
+			uint32 tid = (i < builder->num_docs) ? entries[i].tenant_id
+												 : UINT32_MAX;
+
+			if (tid != run_tenant)
+			{
+				/* Emit range for run_tenant (skip tenant_id=0) */
+				if (run_tenant != 0)
+				{
+					if (range_cnt >= range_cap)
+					{
+						range_cap *= 2;
+						ranges = repalloc(
+								ranges,
+								range_cap * sizeof(TpDocMapTenantRange));
+					}
+					ranges[range_cnt].tenant_id	   = run_tenant;
+					ranges[range_cnt].first_doc_id = run_start;
+					ranges[range_cnt].doc_count	   = i - run_start;
+					range_cnt++;
+				}
+				run_start  = i;
+				run_tenant = tid;
+			}
+		}
+
+		builder->tenant_ranges	   = ranges;
+		builder->num_tenant_ranges = range_cnt;
 	}
 
 	pfree(entries);
@@ -239,6 +334,9 @@ tp_docmap_destroy(TpDocMapBuilder *builder)
 
 	if (builder->tenant_ids)
 		pfree(builder->tenant_ids);
+
+	if (builder->tenant_ranges)
+		pfree(builder->tenant_ranges);
 
 	pfree(builder);
 }

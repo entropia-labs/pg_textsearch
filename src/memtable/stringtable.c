@@ -494,7 +494,7 @@ tp_add_document_terms(
 	}
 
 	/* Store document length in the document length table */
-	tp_store_document_length(local_state, ctid, doc_length);
+	tp_store_document_length(local_state, ctid, doc_length, tenant_id);
 
 	/*
 	 * Update corpus statistics.

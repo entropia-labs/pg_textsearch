@@ -89,7 +89,8 @@ typedef struct TpSegmentHeader
 	uint32 tenant_map_offset;	  /* Offset to tenant_id table (uint32/doc) */
 	uint32 tenant_stats_offset;	  /* Offset to per-tenant stats */
 	uint32 tenant_docfreq_offset; /* Offset to per-term per-tenant doc_freq */
-	uint32 flags;				  /* Bit 0: has_tenant_data */
+	uint32 tenant_ranges_offset;  /* Offset to tenant doc_id ranges */
+	uint32 flags;				  /* Bit flags: see TP_FLAG_* */
 } TpSegmentHeader;
 
 /*
@@ -190,6 +191,7 @@ typedef struct TpSkipEntry
 
 /* V4 header flags */
 #define TP_FLAG_HAS_TENANT_DATA 0x01
+#define TP_FLAG_TENANT_ORDERED	0x02
 
 /*
  * Per-tenant corpus statistics.
@@ -361,6 +363,18 @@ extern void tp_segment_load_tenant_ids(TpSegmentReader *reader);
 /* Get tenant_id for a doc_id. Returns 0 if no tenant data. */
 extern uint32 tp_segment_get_tenant_id(TpSegmentReader *reader, uint32 doc_id);
 
+/*
+ * Get contiguous doc_id range for a tenant in a tenant-ordered segment.
+ * Returns true if the segment is tenant-ordered and the tenant is found.
+ * Sets *out_first and *out_last to the inclusive doc_id range.
+ * Returns false for non-tenant-ordered segments or missing tenants.
+ */
+extern bool tp_segment_get_tenant_doc_range(
+		TpSegmentReader *reader,
+		uint32			 tenant_id,
+		uint32			*out_first,
+		uint32			*out_last);
+
 /* Zero-copy reader functions */
 typedef struct TpSegmentDirectAccess
 {
@@ -450,6 +464,10 @@ typedef struct TpSegmentPostingIterator
 	/* Fallback buffer for when block spans page boundaries */
 	TpBlockPosting *fallback_block;
 	uint32			fallback_block_size;
+
+	/* Optional doc_id range restriction (Phase 7) */
+	uint32 min_doc_id; /* 0 = no restriction */
+	uint32 max_doc_id; /* UINT32_MAX = no restriction */
 
 	/* Output posting (converted for scoring compatibility) */
 	TpSegmentPosting output_posting;

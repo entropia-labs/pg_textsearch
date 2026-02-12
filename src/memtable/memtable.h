@@ -30,6 +30,7 @@ typedef struct TpDocLengthEntry
 	ItemPointerData ctid;		/* Key: Document heap tuple ID */
 	int32			doc_length; /* Value: Document length (sum of term
 								 * frequencies) */
+	uint32 tenant_id;			/* Tenant ID (0 = no tenant) */
 } TpDocLengthEntry;
 
 /* Default hash table size */

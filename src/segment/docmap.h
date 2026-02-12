@@ -30,7 +30,20 @@ typedef struct TpDocMapEntry
 	ItemPointerData ctid;		/* Key: heap tuple location */
 	uint32			doc_id;		/* Value: segment-local doc ID */
 	uint32			doc_length; /* Document length (for fieldnorm) */
+	uint32			tenant_id;	/* Tenant ID (0 = no tenant) */
 } TpDocMapEntry;
+
+/*
+ * Per-tenant contiguous doc_id range in a tenant-ordered segment.
+ * After tenant-aware finalize, each tenant's docs occupy a contiguous
+ * range [first_doc_id, first_doc_id + doc_count - 1].
+ */
+typedef struct TpDocMapTenantRange
+{
+	uint32 tenant_id;
+	uint32 first_doc_id;
+	uint32 doc_count;
+} TpDocMapTenantRange;
 
 /*
  * Document map builder context.
@@ -48,6 +61,11 @@ typedef struct TpDocMapBuilder
 	OffsetNumber *ctid_offsets; /* doc_id → tuple offset (2 bytes) */
 	uint8		 *fieldnorms;	/* doc_id → encoded length (1 byte) */
 	uint32		 *tenant_ids;	/* doc_id → tenant_id (4 bytes, or NULL) */
+
+	/* Tenant ranges (valid after finalize, only if tenant_ordered) */
+	TpDocMapTenantRange *tenant_ranges;
+	uint32				 num_tenant_ranges;
+	bool				 tenant_ordered; /* True if sorted by tenant */
 } TpDocMapBuilder;
 
 /*
@@ -62,8 +80,11 @@ extern TpDocMapBuilder *tp_docmap_create(void);
  * doc_length is stored for fieldnorm encoding; if CTID already exists, the
  * original doc_length is kept (callers should ensure consistent lengths).
  */
-extern uint32
-tp_docmap_add(TpDocMapBuilder *builder, ItemPointer ctid, uint32 doc_length);
+extern uint32 tp_docmap_add(
+		TpDocMapBuilder *builder,
+		ItemPointer		 ctid,
+		uint32			 doc_length,
+		uint32			 tenant_id);
 
 /*
  * Look up doc_id for a CTID using hash table.
@@ -99,6 +120,18 @@ tp_docmap_get_tenant_id(TpDocMapBuilder *builder, uint32 doc_id)
 	if (builder->tenant_ids == NULL || doc_id >= builder->num_docs)
 		return 0;
 	return builder->tenant_ids[doc_id];
+}
+
+/*
+ * Get the tenant ranges array. Valid after finalize if tenant_ordered.
+ */
+static inline const TpDocMapTenantRange *
+tp_docmap_get_tenant_ranges(TpDocMapBuilder *builder, uint32 *num_ranges_out)
+{
+	Assert(builder->finalized);
+	if (num_ranges_out)
+		*num_ranges_out = builder->num_tenant_ranges;
+	return builder->tenant_ranges;
 }
 
 /*

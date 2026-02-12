@@ -131,7 +131,11 @@ test-cic:
 	@echo "Running CREATE INDEX CONCURRENTLY tests..."
 	@cd test/scripts && ./cic.sh
 
-test-shell: test-concurrency test-recovery test-segment test-cic
+test-tenant-filter:
+	@echo "Running tenant filter cross-session tests..."
+	@cd test/scripts && PG_BIN_DIR=$(shell $(PG_CONFIG) --bindir) ./tenant_filter.sh
+
+test-shell: test-concurrency test-recovery test-segment test-cic test-tenant-filter
 	@echo "All shell-based tests completed"
 
 test-all: test test-shell
@@ -287,6 +291,7 @@ help:
 	@echo "  make test-segment     - Run multi-backend segment tests"
 	@echo "  make test-stress      - Run long-running stress tests"
 	@echo "  make test-cic         - Run CREATE INDEX CONCURRENTLY tests"
+	@echo "  make test-tenant-filter - Run tenant filter cross-session tests"
 	@echo "  make expected     - Generate expected output files from test results"
 	@echo ""
 	@echo "Code formatting targets:"
@@ -310,4 +315,4 @@ help:
 	@echo "  make test-all"
 	@echo "  make format"
 
-.PHONY: test clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help rust-test rust-clean
+.PHONY: test clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-tenant-filter test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help rust-test rust-clean

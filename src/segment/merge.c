@@ -630,6 +630,9 @@ build_merged_docmap(
 		/* Allocate mapping array for this source */
 		mapping->old_to_new[i] = palloc(num_docs * sizeof(uint32));
 
+		/* Lazy-load tenant_ids for this source segment */
+		tp_segment_load_tenant_ids(sources[i].reader);
+
 		for (j = 0; j < num_docs; j++)
 		{
 			ItemPointerData ctid;
@@ -637,6 +640,7 @@ build_merged_docmap(
 			OffsetNumber	offset;
 			uint8			fieldnorm;
 			uint32			doc_length;
+			uint32			tid;
 
 			/*
 			 * Read CTID from split arrays.
@@ -671,8 +675,11 @@ build_merged_docmap(
 					sizeof(uint8));
 			doc_length = decode_fieldnorm(fieldnorm);
 
-			/* Add to merged docmap (doc_id assigned here is temporary) */
-			tp_docmap_add(docmap, &ctid, doc_length);
+			/* Get tenant_id from source segment */
+			tid = tp_segment_get_tenant_id(sources[i].reader, j);
+
+			/* Add to merged docmap (doc_id is temporary) */
+			tp_docmap_add(docmap, &ctid, doc_length, tid);
 		}
 	}
 
@@ -829,6 +836,22 @@ collect_term_postings(
 
 	*count = num;
 	return postings;
+}
+
+/*
+ * Compare block postings by doc_id for qsort.
+ */
+static int
+merge_cmp_block_posting_by_doc_id(const void *a, const void *b)
+{
+	uint32 da = ((const TpBlockPosting *)a)->doc_id;
+	uint32 db = ((const TpBlockPosting *)b)->doc_id;
+
+	if (da < db)
+		return -1;
+	if (da > db)
+		return 1;
+	return 0;
 }
 
 /*
@@ -997,7 +1020,7 @@ write_merged_segment(
 		num_blocks = (doc_count + TP_BLOCK_SIZE - 1) / TP_BLOCK_SIZE;
 		term_blocks[i].block_count = (uint16)num_blocks;
 
-		/* Convert postings to block format using direct mapping lookup */
+		/* Convert postings to block format using direct mapping */
 		block_postings = palloc(doc_count * sizeof(TpBlockPosting));
 		for (j = 0; j < doc_count; j++)
 		{
@@ -1009,11 +1032,16 @@ write_merged_segment(
 			block_postings[j].frequency = postings[j].frequency;
 			block_postings[j].fieldnorm = postings[j].fieldnorm;
 			block_postings[j].reserved	= 0;
-
-			if (postings[j].tenant_id != 0)
-				tp_docmap_set_tenant_id(
-						docmap, new_doc_id, postings[j].tenant_id);
 		}
+
+		/*
+		 * Sort block_postings by doc_id. Required because
+		 * tenant-ordered doc_ids may differ from CTID order.
+		 */
+		qsort(block_postings,
+			  doc_count,
+			  sizeof(TpBlockPosting),
+			  merge_cmp_block_posting_by_doc_id);
 
 		/* Write posting blocks and build skip entries */
 		for (block_idx = 0; block_idx < num_blocks; block_idx++)
@@ -1374,6 +1402,21 @@ write_merged_segment(
 		}
 	}
 
+	/* Write tenant ranges section if docmap is tenant-ordered */
+	header.tenant_ranges_offset = 0;
+	if (docmap->tenant_ordered && docmap->num_tenant_ranges > 0)
+	{
+		uint32 num_ranges = docmap->num_tenant_ranges;
+
+		header.tenant_ranges_offset = writer.current_offset;
+		tp_segment_writer_write(&writer, &num_ranges, sizeof(uint32));
+		tp_segment_writer_write(
+				&writer,
+				docmap->tenant_ranges,
+				num_ranges * sizeof(TpDocMapTenantRange));
+		header.flags |= TP_FLAG_TENANT_ORDERED;
+	}
+
 	/* Flush and write page index */
 	tp_segment_writer_flush(&writer);
 
@@ -1514,6 +1557,7 @@ write_merged_segment(
 	existing_header->tenant_map_offset	   = header.tenant_map_offset;
 	existing_header->tenant_stats_offset   = header.tenant_stats_offset;
 	existing_header->tenant_docfreq_offset = header.tenant_docfreq_offset;
+	existing_header->tenant_ranges_offset  = header.tenant_ranges_offset;
 	existing_header->flags				   = header.flags;
 
 	MarkBufferDirty(header_buf);

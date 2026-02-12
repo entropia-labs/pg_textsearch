@@ -269,7 +269,10 @@ tp_doclength_table_attach(dsa_area *area, dshash_table_handle handle)
  */
 void
 tp_store_document_length(
-		TpLocalIndexState *local_state, ItemPointer ctid, int32 doc_length)
+		TpLocalIndexState *local_state,
+		ItemPointer		   ctid,
+		int32			   doc_length,
+		uint32			   tenant_id)
 {
 	TpMemtable		 *memtable;
 	dshash_table	 *doclength_table;
@@ -301,6 +304,7 @@ tp_store_document_length(
 			dshash_find_or_insert(doclength_table, ctid, &found);
 	entry->ctid		  = *ctid;
 	entry->doc_length = doc_length;
+	entry->tenant_id  = tenant_id;
 
 	dshash_release_lock(doclength_table, entry);
 	dshash_detach(doclength_table);

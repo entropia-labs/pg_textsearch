@@ -882,7 +882,11 @@ build_docmap_from_memtable(TpLocalIndexState *state)
 	while ((doc_entry = (TpDocLengthEntry *)dshash_seq_next(&seq_status)) !=
 		   NULL)
 	{
-		tp_docmap_add(docmap, &doc_entry->ctid, (uint32)doc_entry->doc_length);
+		tp_docmap_add(
+				docmap,
+				&doc_entry->ctid,
+				(uint32)doc_entry->doc_length,
+				doc_entry->tenant_id);
 	}
 	dshash_seq_term(&seq_status);
 	dshash_detach(doc_lengths_hash);
@@ -891,6 +895,23 @@ build_docmap_from_memtable(TpLocalIndexState *state)
 	tp_docmap_finalize(docmap);
 
 	return docmap;
+}
+
+/*
+ * Compare block postings by doc_id for qsort.
+ * Required after tenant-ordered doc_id assignment.
+ */
+static int
+cmp_block_posting_by_doc_id(const void *a, const void *b)
+{
+	uint32 da = ((const TpBlockPosting *)a)->doc_id;
+	uint32 db = ((const TpBlockPosting *)b)->doc_id;
+
+	if (da < db)
+		return -1;
+	if (da > db)
+		return 1;
+	return 0;
 }
 
 /*
@@ -1236,12 +1257,19 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 				block_postings[j].frequency = (uint16)entries[j].frequency;
 				block_postings[j].fieldnorm = norm;
 				block_postings[j].reserved	= 0;
-
-				if (has_tenant_data && entries[j].tenant_id != 0)
-					tp_docmap_set_tenant_id(
-							docmap, doc_id, entries[j].tenant_id);
 			}
 		}
+
+		/*
+		 * Sort block_postings by doc_id. Required because
+		 * tenant-ordered doc_ids may differ from CTID order,
+		 * and also fixes a latent issue with concurrent inserts
+		 * where memtable postings arrive out of CTID order.
+		 */
+		qsort(block_postings,
+			  doc_count,
+			  sizeof(TpBlockPosting),
+			  cmp_block_posting_by_doc_id);
 
 		/* Write posting blocks and build skip entries */
 		for (block_idx = 0; block_idx < num_blocks; block_idx++)
@@ -1500,6 +1528,21 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 		header.flags |= TP_FLAG_HAS_TENANT_DATA;
 	}
 
+	/* Write tenant ranges section if docmap is tenant-ordered */
+	header.tenant_ranges_offset = 0;
+	if (docmap->tenant_ordered && docmap->num_tenant_ranges > 0)
+	{
+		uint32 num_ranges = docmap->num_tenant_ranges;
+
+		header.tenant_ranges_offset = writer.current_offset;
+		tp_segment_writer_write(&writer, &num_ranges, sizeof(uint32));
+		tp_segment_writer_write(
+				&writer,
+				docmap->tenant_ranges,
+				num_ranges * sizeof(TpDocMapTenantRange));
+		header.flags |= TP_FLAG_TENANT_ORDERED;
+	}
+
 	/* Write page index */
 	tp_segment_writer_flush(&writer);
 
@@ -1653,6 +1696,7 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	existing_header->tenant_map_offset	   = header.tenant_map_offset;
 	existing_header->tenant_stats_offset   = header.tenant_stats_offset;
 	existing_header->tenant_docfreq_offset = header.tenant_docfreq_offset;
+	existing_header->tenant_ranges_offset  = header.tenant_ranges_offset;
 	existing_header->flags				   = header.flags;
 
 	MarkBufferDirty(header_buf);

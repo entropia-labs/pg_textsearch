@@ -198,6 +198,37 @@ tp_get_local_index_state(Oid index_oid)
 				hash_search(local_state_cache, &index_oid, HASH_ENTER, &found);
 		entry->local_state = local_state;
 
+		/*
+		 * Load tenant stats from disk if not yet in shared memory.
+		 * When a new backend attaches to an already-registered index,
+		 * the memtable's tenant_stats_handle may be INVALID if no
+		 * backend has loaded the stats since the last memtable clear.
+		 * The authoritative tenant stats are on disk in metapages.
+		 */
+		{
+			TpMemtable *memtable = get_memtable(local_state);
+
+			if (memtable &&
+				memtable->tenant_stats_handle == DSHASH_HANDLE_INVALID)
+			{
+				Relation		index_rel;
+				TpIndexMetaPage metap;
+
+				index_rel = index_open(index_oid, AccessShareLock);
+				metap	  = tp_get_metapage(index_rel);
+
+				if (metap && metap->tenant_column_attno != 0 &&
+					metap->first_tenant_stats_page != InvalidBlockNumber)
+				{
+					tp_read_tenant_stats_pages(index_rel, local_state);
+				}
+
+				if (metap)
+					pfree(metap);
+				index_close(index_rel, AccessShareLock);
+			}
+		}
+
 		return local_state;
 	}
 }

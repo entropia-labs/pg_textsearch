@@ -788,6 +788,115 @@ get_index_tenant_attnum(Oid index_oid)
 }
 
 /*
+ * Try to inject tenant_id into a single BM25 <@> OpExpr's bm25query.
+ *
+ * Given a <@> OpExpr with a resolved bm25query, checks the WHERE
+ * clause for an equality predicate on the index's tenant_column and
+ * injects the tenant_id into the bm25query Const in-place.
+ */
+static void
+try_inject_tenant_into_opexpr(
+		OpExpr *opexpr, Node *quals, BM25OidCache *oids, Query *query)
+{
+	Node	  *left;
+	Node	  *right;
+	Const	  *constNode;
+	TpQuery	  *tpquery;
+	Oid		   index_oid;
+	AttrNumber tenant_attnum;
+	Var		  *var;
+	Oid		   relid;
+	AttrNumber col_attnum;
+	uint32	   tenant_id;
+	TpQuery	  *new_tpquery;
+
+	if (opexpr->opno != oids->text_tpquery_operator_oid)
+		return;
+	if (list_length(opexpr->args) != 2)
+		return;
+
+	left  = linitial(opexpr->args);
+	right = lsecond(opexpr->args);
+
+	/* Fold FuncExpr (e.g. to_bm25query()) to Const */
+	if (IsA(right, FuncExpr))
+	{
+		right = eval_const_expressions(NULL, right);
+		if (IsA(right, Const))
+			lsecond(opexpr->args) = right;
+	}
+
+	if (!IsA(left, Var) || !IsA(right, Const))
+		return;
+
+	constNode = (Const *)right;
+	if (constNode->consttype != oids->tpquery_type_oid ||
+		constNode->constisnull)
+		return;
+
+	tpquery	  = (TpQuery *)DatumGetPointer(constNode->constvalue);
+	index_oid = get_tpquery_index_oid(tpquery);
+	if (!OidIsValid(index_oid))
+		return;
+
+	/* Already has a tenant_id set */
+	if (get_tpquery_tenant_id(tpquery) != 0)
+		return;
+
+	/* Check if this index has a tenant_column */
+	tenant_attnum = get_index_tenant_attnum(index_oid);
+	if (tenant_attnum == InvalidAttrNumber)
+		return;
+
+	/* Get the table OID from the Var */
+	var = (Var *)left;
+	if (!get_var_relation_and_attnum(var, query, &relid, &col_attnum))
+		return;
+
+	/* Search WHERE clause for tenant_col = const */
+	if (!find_equality_const_for_column(
+				quals, var->varno, tenant_attnum, &tenant_id))
+		return;
+
+	/* Inject tenant_id into the bm25query */
+	new_tpquery			  = create_tpquery_with_tenant(tpquery, tenant_id);
+	constNode->constvalue = PointerGetDatum(new_tpquery);
+	constNode->constlen	  = VARSIZE(new_tpquery);
+}
+
+/*
+ * Walker context for inject_tenant_quals_walker.
+ */
+typedef struct InjectTenantQualsContext
+{
+	Node		 *quals;
+	BM25OidCache *oids;
+	Query		 *query;
+} InjectTenantQualsContext;
+
+/*
+ * Walk an expression tree and inject tenant_id into any
+ * bm25query Consts found in <@> OpExprs.
+ *
+ * This handles <@> OpExprs nested inside comparison operators
+ * (e.g., content <@> bm25query < 0 in the WHERE clause).
+ */
+static bool
+inject_tenant_quals_walker(Node *node, InjectTenantQualsContext *ctx)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, OpExpr))
+	{
+		try_inject_tenant_into_opexpr(
+				(OpExpr *)node, ctx->quals, ctx->oids, ctx->query);
+	}
+
+	return expression_tree_walker(node, inject_tenant_quals_walker, ctx);
+}
+
+/*
  * Inject tenant_id from WHERE clause into bm25query constants.
  *
  * After index resolution, bm25query Consts have their index_oid set.
@@ -796,6 +905,10 @@ get_index_tenant_attnum(Oid index_oid)
  *
  * This enables the index scan to filter by tenant at the posting list
  * level rather than relying on the executor's recheck.
+ *
+ * Injects into both target list and WHERE clause expressions to
+ * ensure all copies of the bm25query have tenant_id set, regardless
+ * of which copy the planner uses for the index scan's orderByKey.
  */
 static void
 inject_tenant_predicate(Query *query, BM25OidCache *oids)
@@ -814,75 +927,26 @@ inject_tenant_predicate(Query *query, BM25OidCache *oids)
 	foreach (lc, query->targetList)
 	{
 		TargetEntry *tle = (TargetEntry *)lfirst(lc);
-		OpExpr		*opexpr;
-		Node		*left;
-		Node		*right;
-		Const		*constNode;
-		TpQuery		*tpquery;
-		Oid			 index_oid;
-		AttrNumber	 tenant_attnum;
-		Var			*var;
-		Oid			 relid;
-		AttrNumber	 col_attnum;
-		uint32		 tenant_id;
-		TpQuery		*new_tpquery;
 
 		if (!IsA(tle->expr, OpExpr))
 			continue;
 
-		opexpr = (OpExpr *)tle->expr;
-		if (opexpr->opno != oids->text_tpquery_operator_oid)
-			continue;
-		if (list_length(opexpr->args) != 2)
-			continue;
+		try_inject_tenant_into_opexpr((OpExpr *)tle->expr, quals, oids, query);
+	}
 
-		left  = linitial(opexpr->args);
-		right = lsecond(opexpr->args);
+	/*
+	 * Walk WHERE clause to inject into bm25query Consts there too.
+	 * The planner may use the quals copy of the <@> expression for
+	 * the index scan's orderByKey rather than the targetList copy.
+	 */
+	{
+		InjectTenantQualsContext ctx;
 
-		/* Fold FuncExpr (e.g. to_bm25query()) to Const */
-		if (IsA(right, FuncExpr))
-		{
-			right = eval_const_expressions(NULL, right);
-			if (IsA(right, Const))
-				lsecond(opexpr->args) = right;
-		}
+		ctx.quals = quals;
+		ctx.oids  = oids;
+		ctx.query = query;
 
-		if (!IsA(left, Var) || !IsA(right, Const))
-			continue;
-
-		constNode = (Const *)right;
-		if (constNode->consttype != oids->tpquery_type_oid ||
-			constNode->constisnull)
-			continue;
-
-		tpquery	  = (TpQuery *)DatumGetPointer(constNode->constvalue);
-		index_oid = get_tpquery_index_oid(tpquery);
-		if (!OidIsValid(index_oid))
-			continue;
-
-		/* Already has a tenant_id set */
-		if (get_tpquery_tenant_id(tpquery) != 0)
-			continue;
-
-		/* Check if this index has a tenant_column */
-		tenant_attnum = get_index_tenant_attnum(index_oid);
-		if (tenant_attnum == InvalidAttrNumber)
-			continue;
-
-		/* Get the table OID from the Var */
-		var = (Var *)left;
-		if (!get_var_relation_and_attnum(var, query, &relid, &col_attnum))
-			continue;
-
-		/* Search WHERE clause for tenant_col = const */
-		if (!find_equality_const_for_column(
-					quals, var->varno, tenant_attnum, &tenant_id))
-			continue;
-
-		/* Inject tenant_id into the bm25query */
-		new_tpquery			  = create_tpquery_with_tenant(tpquery, tenant_id);
-		constNode->constvalue = PointerGetDatum(new_tpquery);
-		constNode->constlen	  = VARSIZE(new_tpquery);
+		inject_tenant_quals_walker(quals, &ctx);
 	}
 }
 
@@ -1601,24 +1665,182 @@ fix_bm25_indexpaths(
 }
 
 /*
- * set_rel_pathlist_hook: Replace BM25 IndexPaths that use the wrong index.
+ * Search a relation's baserestrictinfo for an equality predicate
+ * on a given column. Returns true if found, with the integer
+ * constant value in *value_out.
+ */
+static bool
+find_equality_const_in_restrictinfo(
+		RelOptInfo *rel, AttrNumber attnum, uint32 *value_out)
+{
+	ListCell *lc;
+
+	foreach (lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo	 = (RestrictInfo *)lfirst(lc);
+		Expr		 *clause = rinfo->clause;
+		OpExpr		 *op;
+		Node		 *left;
+		Node		 *right;
+		Var			 *var;
+		Const		 *con;
+
+		if (!IsA(clause, OpExpr))
+			continue;
+
+		op = (OpExpr *)clause;
+		if (list_length(op->args) != 2)
+			continue;
+
+		left  = linitial(op->args);
+		right = lsecond(op->args);
+
+		/* Check Var = Const (either order) */
+		if (IsA(left, Var) && IsA(right, Const))
+		{
+			var = (Var *)left;
+			con = (Const *)right;
+		}
+		else if (IsA(left, Const) && IsA(right, Var))
+		{
+			var = (Var *)right;
+			con = (Const *)left;
+		}
+		else
+			continue;
+
+		if (con->constisnull)
+			continue;
+		if (con->consttype != INT4OID && con->consttype != INT8OID)
+			continue;
+		if (var->varattno != attnum)
+			continue;
+
+		/* Verify equality operator */
+		{
+			char *opname = get_opname(op->opno);
+
+			if (opname == NULL || strcmp(opname, "=") != 0)
+				continue;
+		}
+
+		if (con->consttype == INT4OID)
+			*value_out = (uint32)DatumGetInt32(con->constvalue);
+		else
+			*value_out = (uint32)DatumGetInt64(con->constvalue);
+
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * Inject tenant_id into bm25query Consts in IndexPath ORDER BY
+ * expressions. Iterates over a path list looking for BM25 IndexPaths
+ * and injects the tenant predicate from the relation's restrictions.
  *
- * When a query specifies an explicit BM25 index via to_bm25query(), we need
- * to ensure the planner uses that index. This hook finds BM25 IndexPaths
- * using the wrong index and updates them to use the correct one.
+ * This handles the first query in a new session where the parse
+ * analysis hook hasn't run yet. The library is loaded (via AM
+ * handler) before this hook runs, so we can safely call extension
+ * functions here.
+ */
+static void
+inject_tenant_in_indexpaths(
+		List *pathlist, RelOptInfo *rel, Oid bm25_am_oid, BM25OidCache *oids)
+{
+	ListCell *lc;
+
+	foreach (lc, pathlist)
+	{
+		Path	  *path = (Path *)lfirst(lc);
+		IndexPath *indexpath;
+		Oid		   index_oid;
+		AttrNumber tenant_attnum;
+		uint32	   tenant_id;
+		ListCell  *lc2;
+
+		index_oid = get_path_bm25_index_oid(path, bm25_am_oid);
+		if (!OidIsValid(index_oid))
+			continue;
+
+		/* Check if index has a tenant column */
+		tenant_attnum = get_index_tenant_attnum(index_oid);
+		if (tenant_attnum == InvalidAttrNumber)
+			continue;
+
+		/* Find tenant_id = const in relation's restrictions */
+		if (!find_equality_const_in_restrictinfo(
+					rel, tenant_attnum, &tenant_id))
+			continue;
+
+		/* Inject into each ORDER BY expression */
+		indexpath = (IndexPath *)path;
+
+		foreach (lc2, indexpath->indexorderbys)
+		{
+			Node *node = (Node *)lfirst(lc2);
+
+			if (!IsA(node, OpExpr))
+				continue;
+
+			{
+				OpExpr	*opexpr = (OpExpr *)node;
+				Node	*right;
+				Const	*constNode;
+				TpQuery *tpquery;
+				TpQuery *new_tpquery;
+
+				if (opexpr->opno != oids->text_tpquery_operator_oid)
+					continue;
+				if (list_length(opexpr->args) != 2)
+					continue;
+
+				right = lsecond(opexpr->args);
+				if (!IsA(right, Const))
+					continue;
+
+				constNode = (Const *)right;
+				if (constNode->consttype != oids->tpquery_type_oid ||
+					constNode->constisnull)
+					continue;
+
+				tpquery = (TpQuery *)DatumGetPointer(constNode->constvalue);
+
+				/* Skip if already has tenant_id */
+				if (get_tpquery_tenant_id(tpquery) != 0)
+					continue;
+
+				/* Inject tenant_id */
+				new_tpquery = create_tpquery_with_tenant(tpquery, tenant_id);
+				constNode->constvalue = PointerGetDatum(new_tpquery);
+				constNode->constlen	  = VARSIZE(new_tpquery);
+			}
+		}
+	}
+}
+
+/*
+ * set_rel_pathlist_hook: Fix BM25 index paths and inject tenant IDs.
  *
- * For partitioned tables, we allow child partition indexes of the specified
- * parent index.
+ * When a query specifies an explicit BM25 index via to_bm25query(), we
+ * need to ensure the planner uses that index.
  *
- * Performance note: This hook returns immediately for non-BM25 queries since
- * current_planning_context will be NULL (we only set it when there are
- * explicit index requirements). The overhead for non-BM25 queries is just
- * a single pointer comparison.
+ * Additionally, this hook injects tenant_id into bm25query Consts in
+ * IndexPath ORDER BY expressions. This is critical for the first query
+ * in a new session: the parse analysis and planner hooks haven't run
+ * (the library is loaded INSIDE standard_planner when the AM handler
+ * is called), but this hook DOES run because it's registered before
+ * path list construction finishes. By modifying the IndexPath's
+ * orderbys here, the tenant_id propagates to the final IndexScan
+ * plan and reaches the AM's rescan callback.
  */
 static void
 tp_set_rel_pathlist_hook(
 		PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
+	BM25OidCache oid_cache;
+
 	/* Call previous hook first */
 	if (prev_set_rel_pathlist_hook)
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
@@ -1627,20 +1849,40 @@ tp_set_rel_pathlist_hook(
 	if (rel->reloptkind != RELOPT_BASEREL)
 		return;
 
-	/* Check if we have planning context */
-	if (current_planning_context == NULL)
+	if (!get_bm25_oids(&oid_cache))
 		return;
 
-	fix_bm25_indexpaths(
-			rel->pathlist,
-			rel,
-			rte->relid,
-			current_planning_context->bm25_am_oid);
-	fix_bm25_indexpaths(
-			rel->partial_pathlist,
-			rel,
-			rte->relid,
-			current_planning_context->bm25_am_oid);
+	/* Fix explicit index paths if planning context exists */
+	if (current_planning_context != NULL)
+	{
+		fix_bm25_indexpaths(
+				rel->pathlist,
+				rel,
+				rte->relid,
+				current_planning_context->bm25_am_oid);
+		fix_bm25_indexpaths(
+				rel->partial_pathlist,
+				rel,
+				rte->relid,
+				current_planning_context->bm25_am_oid);
+	}
+
+	/*
+	 * Inject tenant_id into BM25 IndexPath ORDER BY expressions.
+	 * This is needed for the first query in a new session where
+	 * inject_tenant_predicate hasn't run in the parse analysis
+	 * hook. For subsequent queries, inject_tenant_predicate
+	 * already handled this and the bm25query Consts already have
+	 * tenant_id set, so the injection below is a no-op.
+	 *
+	 * Uses rel->baserestrictinfo (the planner's per-relation
+	 * restriction list) rather than the raw jointree quals, which
+	 * may have been restructured by the planner.
+	 */
+	inject_tenant_in_indexpaths(
+			rel->pathlist, rel, oid_cache.bm25_am_oid, &oid_cache);
+	inject_tenant_in_indexpaths(
+			rel->partial_pathlist, rel, oid_cache.bm25_am_oid, &oid_cache);
 }
 
 /*

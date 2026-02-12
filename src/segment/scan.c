@@ -12,6 +12,7 @@
 #include "memtable/posting.h"
 #include "query/score.h"
 #include "segment/dictionary.h"
+#include "segment/docmap.h"
 #include "segment/fieldnorm.h"
 #include "segment/segment.h"
 #include "state/state.h"
@@ -1280,4 +1281,69 @@ tp_batch_get_segment_tenant_doc_freq(
 
 	if (term_buffer)
 		pfree(term_buffer);
+}
+
+/*
+ * Look up the contiguous doc_id range for a tenant in a segment.
+ * Returns true if the segment is tenant-ordered and the tenant has
+ * docs, setting *out_first and *out_last to the inclusive range.
+ * Returns false for non-tenant-ordered segments or missing tenants.
+ */
+bool
+tp_segment_get_tenant_doc_range(
+		TpSegmentReader *reader,
+		uint32			 tenant_id,
+		uint32			*out_first,
+		uint32			*out_last)
+{
+	TpSegmentHeader *header;
+	uint32			 num_ranges;
+	int				 lo, hi;
+
+	if (!reader || !reader->header)
+		return false;
+
+	header = reader->header;
+
+	/* Must be a tenant-ordered segment with ranges */
+	if (!(header->flags & TP_FLAG_TENANT_ORDERED) ||
+		header->tenant_ranges_offset == 0)
+		return false;
+
+	/* Read number of ranges */
+	tp_segment_read(
+			reader, header->tenant_ranges_offset, &num_ranges, sizeof(uint32));
+
+	if (num_ranges == 0)
+		return false;
+
+	/* Binary search for tenant_id in sorted ranges array */
+	lo = 0;
+	hi = (int)num_ranges - 1;
+
+	while (lo <= hi)
+	{
+		int					mid = lo + (hi - lo) / 2;
+		TpDocMapTenantRange range;
+
+		tp_segment_read(
+				reader,
+				header->tenant_ranges_offset + sizeof(uint32) +
+						mid * sizeof(TpDocMapTenantRange),
+				&range,
+				sizeof(TpDocMapTenantRange));
+
+		if (range.tenant_id == tenant_id)
+		{
+			*out_first = range.first_doc_id;
+			*out_last  = range.first_doc_id + range.doc_count - 1;
+			return true;
+		}
+		else if (range.tenant_id < tenant_id)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+
+	return false;
 }

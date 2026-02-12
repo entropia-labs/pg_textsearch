@@ -50,7 +50,10 @@ extern void tp_add_document_to_posting_list(
 
 /* Document length hash table operations */
 extern void tp_store_document_length(
-		TpLocalIndexState *local_state, ItemPointer ctid, int32 doc_length);
+		TpLocalIndexState *local_state,
+		ItemPointer		   ctid,
+		int32			   doc_length,
+		uint32			   tenant_id);
 
 extern int32 tp_get_document_length(
 		TpLocalIndexState *local_state, Relation index, ItemPointer ctid);

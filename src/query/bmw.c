@@ -479,7 +479,9 @@ score_segment_single_term_bmw(
 		float4			 b,
 		float4			 avg_doc_len,
 		TpBMWStats		*stats,
-		uint32			 tenant_id)
+		uint32			 tenant_id,
+		uint32			 min_doc_id,
+		uint32			 max_doc_id)
 {
 	TpSegmentPostingIterator iter;
 	TpSegmentPosting		*posting;
@@ -516,6 +518,14 @@ score_segment_single_term_bmw(
 		{
 			float4 threshold = tp_topk_threshold(heap);
 			float4 block_max = block_max_scores[i];
+
+			/* Skip block entirely before tenant range */
+			if (skip_entries[i].last_doc_id < min_doc_id)
+			{
+				if (stats)
+					stats->blocks_skipped++;
+				continue;
+			}
 
 			/* Skip block if it can't beat threshold */
 			if (block_max < threshold)
@@ -559,8 +569,16 @@ score_segment_single_term_bmw(
 				if (iter.current_block != i)
 					break;
 
+				/* Stop if past tenant range */
+				if (posting->doc_id > max_doc_id)
+					break;
+
+				/* Skip docs before tenant range */
+				if (posting->doc_id < min_doc_id)
+					continue;
+
 				/* Skip docs not matching tenant filter */
-				if (tenant_id != 0 &&
+				if (tenant_id != 0 && max_doc_id == UINT32_MAX &&
 					tp_segment_get_tenant_id(reader, posting->doc_id) !=
 							tenant_id)
 					continue;
@@ -644,7 +662,31 @@ tp_score_single_term_bmw(
 
 		while (seg_head != InvalidBlockNumber)
 		{
-			TpSegmentReader *reader = tp_segment_open(index, seg_head);
+			TpSegmentReader *reader	 = tp_segment_open(index, seg_head);
+			uint32			 seg_min = 0;
+			uint32			 seg_max = UINT32_MAX;
+
+			if (tenant_id != 0)
+			{
+				if (reader->header->flags & TP_FLAG_TENANT_ORDERED)
+				{
+					uint32 first, last;
+
+					if (tp_segment_get_tenant_doc_range(
+								reader, tenant_id, &first, &last))
+					{
+						seg_min = first;
+						seg_max = last;
+					}
+					else
+					{
+						/* Tenant has no docs in this segment */
+						seg_head = reader->header->next_segment;
+						tp_segment_close(reader);
+						continue;
+					}
+				}
+			}
 
 			score_segment_single_term_bmw(
 					&heap,
@@ -655,7 +697,9 @@ tp_score_single_term_bmw(
 					b,
 					avg_doc_len,
 					stats,
-					tenant_id);
+					tenant_id,
+					seg_min,
+					seg_max);
 
 			seg_head = reader->header->next_segment;
 			tp_segment_close(reader);
@@ -1384,7 +1428,9 @@ score_segment_multi_term_bmw(
 		float4			 b,
 		float4			 avg_doc_len,
 		TpBMWStats		*stats,
-		uint32			 tenant_id)
+		uint32			 tenant_id,
+		uint32			 min_doc_id,
+		uint32			 max_doc_id)
 {
 	int active_count;
 
@@ -1399,6 +1445,29 @@ score_segment_multi_term_bmw(
 
 	/* Sort terms by current doc_id for WAND traversal */
 	sort_terms_by_doc_id(terms, term_count);
+
+	/* Seek all active terms to min_doc_id if range-restricted */
+	if (min_doc_id > 0)
+	{
+		int term_idx;
+
+		for (term_idx = 0; term_idx < term_count; term_idx++)
+		{
+			TpTermState *ts = &terms[term_idx];
+
+			if (!ts->found || ts->iter.finished)
+				continue;
+
+			if (term_current_doc_id(ts) < min_doc_id)
+			{
+				if (!seek_term_to_doc(ts, min_doc_id))
+					active_count--;
+			}
+		}
+
+		/* Re-sort after seeking */
+		sort_terms_by_doc_id(terms, term_count);
+	}
 
 	/* WAND main loop */
 	while (active_count > 0)
@@ -1416,6 +1485,10 @@ score_segment_multi_term_bmw(
 		if (!find_wand_pivot(
 					terms, term_count, threshold, &pivot_len, &pivot_doc_id))
 			break; /* No term combination can beat threshold */
+
+		/* Stop if pivot is past tenant range */
+		if (pivot_doc_id > max_doc_id)
+			break;
 
 		/* Step 2: Seek pre-pivot terms to pivot_doc_id */
 		if (!seek_to_pivot(
@@ -1443,7 +1516,7 @@ score_segment_multi_term_bmw(
 			continue; /* Re-pivot with new positions */
 
 		/* Step 5: Check tenant filter before scoring */
-		if (tenant_id != 0 &&
+		if (tenant_id != 0 && max_doc_id == UINT32_MAX &&
 			tp_segment_get_tenant_id(reader, pivot_doc_id) != tenant_id)
 		{
 			/*
@@ -1594,7 +1667,30 @@ tp_score_multi_term_bmw(
 
 		while (seg_head != InvalidBlockNumber)
 		{
-			TpSegmentReader *reader = tp_segment_open(index, seg_head);
+			TpSegmentReader *reader	 = tp_segment_open(index, seg_head);
+			uint32			 seg_min = 0;
+			uint32			 seg_max = UINT32_MAX;
+
+			if (tenant_id != 0)
+			{
+				if (reader->header->flags & TP_FLAG_TENANT_ORDERED)
+				{
+					uint32 first, last;
+
+					if (tp_segment_get_tenant_doc_range(
+								reader, tenant_id, &first, &last))
+					{
+						seg_min = first;
+						seg_max = last;
+					}
+					else
+					{
+						seg_head = reader->header->next_segment;
+						tp_segment_close(reader);
+						continue;
+					}
+				}
+			}
 
 			score_segment_multi_term_bmw(
 					&heap,
@@ -1605,7 +1701,9 @@ tp_score_multi_term_bmw(
 					b,
 					avg_doc_len,
 					stats,
-					tenant_id);
+					tenant_id,
+					seg_min,
+					seg_max);
 
 			seg_head = reader->header->next_segment;
 			tp_segment_close(reader);
