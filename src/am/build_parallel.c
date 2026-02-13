@@ -141,6 +141,7 @@ tp_build_parallel(
 	Size				   shmem_size;
 	dsa_area			  *dsa;
 	int					   launched;
+	HTAB				  *accum_tenant_stats = NULL;
 
 	/* Ensure reasonable number of workers */
 	if (nworkers > TP_MAX_PARALLEL_WORKERS)
@@ -219,72 +220,42 @@ tp_build_parallel(
 	 * Leader processes worker memtables and writes segments.
 	 * This continues until all workers are done.
 	 */
+	tp_leader_process_buffers(shared, index, dsa, &accum_tenant_stats);
+
+	/* Wait for all workers to finish */
+	WaitForParallelWorkersToFinish(pcxt);
+
+	/* Report final tuple count */
+	pgstat_progress_update_param(
+			PROGRESS_CREATEIDX_TUPLES_DONE,
+			(int64)pg_atomic_read_u64(&shared->total_docs));
+
+	/* Report compacting phase (metapage update, compaction, truncation) */
+	pgstat_progress_update_param(
+			PROGRESS_CREATEIDX_SUBPHASE, TP_PHASE_COMPACTING);
+
+	/* Update metapage with L0 chain and statistics */
 	{
-		HTAB *accum_tenant_stats = NULL;
+		Buffer			metabuf;
+		Page			metapage;
+		TpIndexMetaPage metap;
 
-		tp_leader_process_buffers(shared, index, dsa, &accum_tenant_stats);
+		metabuf = ReadBuffer(index, 0);
+		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+		metapage = BufferGetPage(metabuf);
+		metap	 = (TpIndexMetaPage)PageGetContents(metapage);
 
-		/* Wait for all workers to finish */
-		WaitForParallelWorkersToFinish(pcxt);
+		metap->level_heads[0]  = shared->segment_head;
+		metap->level_counts[0] = shared->segment_count;
+		metap->total_docs = (int32)pg_atomic_read_u64(&shared->total_docs);
+		metap->total_len  = (int64)pg_atomic_read_u64(&shared->total_len);
 
-		/* Report final tuple count */
-		pgstat_progress_update_param(
-				PROGRESS_CREATEIDX_TUPLES_DONE,
-				(int64)pg_atomic_read_u64(&shared->total_docs));
+		MarkBufferDirty(metabuf);
+		UnlockReleaseBuffer(metabuf);
 
-		/* Report compacting phase (metapage update, compaction, truncation) */
-		pgstat_progress_update_param(
-				PROGRESS_CREATEIDX_SUBPHASE, TP_PHASE_COMPACTING);
-
-		/* Update metapage with L0 chain and statistics */
-		{
-			Buffer			metabuf;
-			Page			metapage;
-			TpIndexMetaPage metap;
-
-			metabuf = ReadBuffer(index, 0);
-			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-			metapage = BufferGetPage(metabuf);
-			metap	 = (TpIndexMetaPage)PageGetContents(metapage);
-
-			metap->level_heads[0]  = shared->segment_head;
-			metap->level_counts[0] = shared->segment_count;
-			metap->total_docs = (int32)pg_atomic_read_u64(&shared->total_docs);
-			metap->total_len  = (int64)pg_atomic_read_u64(&shared->total_len);
-
-			MarkBufferDirty(metabuf);
-			UnlockReleaseBuffer(metabuf);
-
-			/* Run compaction if needed (threshold is 8 segments per level) */
-			tp_maybe_compact_level(index, 0);
-		}
-
-		/* Write accumulated per-tenant stats to disk */
-		if (accum_tenant_stats != NULL)
-		{
-			int					n_entries;
-			TpTenantStatsEntry *entries_arr;
-			HASH_SEQ_STATUS		seq;
-			TpTenantStatsEntry *e;
-			int					idx = 0;
-
-			n_entries = hash_get_num_entries(accum_tenant_stats);
-			if (n_entries > 0)
-			{
-				entries_arr = palloc(n_entries * sizeof(TpTenantStatsEntry));
-				hash_seq_init(&seq, accum_tenant_stats);
-				while ((e = (TpTenantStatsEntry *)hash_seq_search(&seq)) !=
-					   NULL)
-				{
-					entries_arr[idx++] = *e;
-				}
-				tp_write_tenant_stats_pages_from_array(
-						index, entries_arr, n_entries);
-				pfree(entries_arr);
-			}
-			hash_destroy(accum_tenant_stats);
-		}
-	} /* end accum_tenant_stats scope */
+		/* Run compaction if needed (threshold is 8 segments per level) */
+		tp_maybe_compact_level(index, 0);
+	}
 
 	/*
 	 * Final truncation: after compaction, L0 segment pages are freed but the
@@ -293,6 +264,11 @@ tp_build_parallel(
 	 *
 	 * We use tp_segment_collect_pages to get ALL pages (data + page index)
 	 * since page index pages can be located anywhere in the file.
+	 *
+	 * IMPORTANT: Tenant stats pages are written AFTER this truncation so
+	 * they are not removed. Previously they were written before truncation,
+	 * but the truncation only considered segment pages for max_used, causing
+	 * tenant stats pages (allocated at P_NEW) to be truncated away.
 	 */
 	{
 		Buffer			metabuf;
@@ -366,6 +342,31 @@ tp_build_parallel(
 #endif
 			}
 		}
+	}
+
+	/* Write accumulated per-tenant stats to disk AFTER truncation */
+	if (accum_tenant_stats != NULL)
+	{
+		int					n_entries;
+		TpTenantStatsEntry *entries_arr;
+		HASH_SEQ_STATUS		seq;
+		TpTenantStatsEntry *e;
+		int					idx = 0;
+
+		n_entries = hash_get_num_entries(accum_tenant_stats);
+		if (n_entries > 0)
+		{
+			entries_arr = palloc(n_entries * sizeof(TpTenantStatsEntry));
+			hash_seq_init(&seq, accum_tenant_stats);
+			while ((e = (TpTenantStatsEntry *)hash_seq_search(&seq)) != NULL)
+			{
+				entries_arr[idx++] = *e;
+			}
+			tp_write_tenant_stats_pages_from_array(
+					index, entries_arr, n_entries);
+			pfree(entries_arr);
+		}
+		hash_destroy(accum_tenant_stats);
 	}
 
 	/* Build result */

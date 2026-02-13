@@ -135,7 +135,11 @@ test-tenant-filter:
 	@echo "Running tenant filter cross-session tests..."
 	@cd test/scripts && PG_BIN_DIR=$(shell $(PG_CONFIG) --bindir) ./tenant_filter.sh
 
-test-shell: test-concurrency test-recovery test-segment test-cic test-tenant-filter
+test-tenant-parallel:
+	@echo "Running parallel build + cross-session tenant tests..."
+	@cd test/scripts && PG_BIN_DIR=$(shell $(PG_CONFIG) --bindir) ./tenant_parallel_cross_session.sh
+
+test-shell: test-concurrency test-recovery test-segment test-cic test-tenant-filter test-tenant-parallel
 	@echo "All shell-based tests completed"
 
 test-all: test test-shell
@@ -315,4 +319,4 @@ help:
 	@echo "  make test-all"
 	@echo "  make format"
 
-.PHONY: test clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-tenant-filter test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help rust-test rust-clean
+.PHONY: test clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-tenant-filter test-tenant-parallel test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help rust-test rust-clean
