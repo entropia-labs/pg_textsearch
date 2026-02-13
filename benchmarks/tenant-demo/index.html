@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pg_textsearch Tenant Search Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 Roboto, Helvetica, Arial, sans-serif;
+    background: #f5f5f5; color: #333; padding: 2rem;
+    max-width: 900px; margin: 0 auto;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 1.5rem; }
+  .controls {
+    display: flex; gap: 0.75rem; align-items: center;
+    margin-bottom: 1rem; flex-wrap: wrap;
+  }
+  select, input[type="text"] {
+    padding: 0.5rem 0.75rem; font-size: 0.95rem;
+    border: 1px solid #ccc; border-radius: 4px;
+    background: #fff;
+  }
+  select { min-width: 180px; }
+  input[type="text"] { flex: 1; min-width: 250px; }
+  .badge {
+    display: inline-block; padding: 0.3rem 0.6rem;
+    border-radius: 4px; font-size: 0.8rem;
+    font-weight: 600; white-space: nowrap;
+  }
+  .badge-time { background: #e8f5e9; color: #2e7d32; }
+  .badge-count { background: #e3f2fd; color: #1565c0; }
+  .meta { display: flex; gap: 0.5rem; margin-bottom: 1rem;
+          align-items: center; min-height: 1.6rem; }
+  table {
+    width: 100%; border-collapse: collapse;
+    background: #fff; border-radius: 4px;
+    overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  }
+  th, td {
+    text-align: left; padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid #eee; font-size: 0.85rem;
+  }
+  th { background: #fafafa; font-weight: 600;
+       font-size: 0.75rem; text-transform: uppercase;
+       color: #666; }
+  td.score { font-family: monospace; }
+  td.snippet {
+    max-width: 400px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+    color: #555;
+  }
+  .empty { color: #999; padding: 2rem; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>pg_textsearch &mdash; Tenant Search Demo</h1>
+
+<div class="controls">
+  <select id="tenant">
+    <option value="">Loading tenants...</option>
+  </select>
+  <input type="text" id="query" placeholder="Type to search..."
+         disabled>
+</div>
+
+<div class="meta" id="meta"></div>
+
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>doc_id</th>
+      <th>chunk_id</th>
+      <th>score</th>
+      <th>content</th>
+    </tr>
+  </thead>
+  <tbody id="results">
+    <tr><td colspan="5" class="empty">
+      Select a tenant and start typing
+    </td></tr>
+  </tbody>
+</table>
+
+<script>
+const tenantEl = document.getElementById("tenant");
+const queryEl  = document.getElementById("query");
+const resultsEl = document.getElementById("results");
+const metaEl   = document.getElementById("meta");
+
+let currentReqId = 0;
+
+async function loadTenants() {
+  const res = await fetch("/api/tenants");
+  const tenants = await res.json();
+  tenantEl.innerHTML = tenants.map(t =>
+    `<option value="${t.id}">` +
+    `Tenant ${t.id} (${t.doc_count.toLocaleString()} rows)` +
+    `</option>`
+  ).join("");
+  queryEl.disabled = false;
+  queryEl.focus();
+}
+
+async function doSearch() {
+  const tenantId = tenantEl.value;
+  const q = queryEl.value.trim();
+
+  if (!q) {
+    resultsEl.innerHTML =
+      `<tr><td colspan="5" class="empty">` +
+      `Type a query above</td></tr>`;
+    metaEl.innerHTML = "";
+    return;
+  }
+
+  const reqId = ++currentReqId;
+
+  const url = `/api/search?tenant_id=${tenantId}` +
+              `&q=${encodeURIComponent(q)}`;
+  const res = await fetch(url);
+  const data = await res.json();
+
+  // Drop stale responses
+  if (reqId !== currentReqId) return;
+
+  metaEl.innerHTML =
+    `<span class="badge badge-time">` +
+    `${data.query_ms.toFixed(2)} ms</span>` +
+    `<span class="badge badge-count">` +
+    `${data.results.length} results</span>`;
+
+  if (data.results.length === 0) {
+    resultsEl.innerHTML =
+      `<tr><td colspan="5" class="empty">` +
+      `No results</td></tr>`;
+    return;
+  }
+
+  resultsEl.innerHTML = data.results.map((r, i) =>
+    `<tr>` +
+    `<td>${i + 1}</td>` +
+    `<td>${r.doc_id}</td>` +
+    `<td>${r.chunk_id}</td>` +
+    `<td class="score">${r.score.toFixed(4)}</td>` +
+    `<td class="snippet">${esc(r.content)}</td>` +
+    `</tr>`
+  ).join("");
+}
+
+function esc(s) {
+  const el = document.createElement("span");
+  el.textContent = s;
+  return el.innerHTML;
+}
+
+queryEl.addEventListener("input", doSearch);
+tenantEl.addEventListener("change", doSearch);
+
+loadTenants();
+</script>
+</body>
+</html>
