@@ -50,3 +50,4 @@ PR_BREAKDOWN.md
 # Python virtual environment
 venv/
 test/sql/*_validated.sql
+tmp_tenant_loadtest/
