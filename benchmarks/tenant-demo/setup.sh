@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Populate the tenant_docs table for the demo app.
-# Wraps the existing 01-setup.sql with sensible defaults.
+# Each tenant gets content from two random vocabulary domains.
 #
 # Usage:
 #   bash setup.sh                     # uses defaults
@@ -10,7 +10,6 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SQL_DIR="${SCRIPT_DIR}/../sql/tenant_loadtest"
 
 NUM_TENANTS="${NUM_TENANTS:-10}"
 DOCS_MULTIPLIER="${DOCS_MULTIPLIER:-1}"
@@ -25,7 +24,7 @@ echo ""
 psql "${DATABASE_URL}" \
     -v num_tenants="${NUM_TENANTS}" \
     -v docs_multiplier="${DOCS_MULTIPLIER}" \
-    -f "${SQL_DIR}/01-setup.sql"
+    -f "${SCRIPT_DIR}/setup.sql"
 
 echo ""
 echo "=== Setup complete ==="
