@@ -158,7 +158,9 @@ PG_FUNCTION_INFO_V1(tpquery_recv);
 PG_FUNCTION_INFO_V1(tpquery_send);
 PG_FUNCTION_INFO_V1(to_tpquery_text);
 PG_FUNCTION_INFO_V1(to_tpquery_text_index);
+PG_FUNCTION_INFO_V1(to_tpquery_text_index_language);
 PG_FUNCTION_INFO_V1(bm25_text_bm25query_score);
+PG_FUNCTION_INFO_V1(bm25_tsvector_bm25query_score);
 PG_FUNCTION_INFO_V1(bm25_text_text_score);
 PG_FUNCTION_INFO_V1(tpquery_eq);
 PG_FUNCTION_INFO_V1(bm25_get_current_score);
@@ -232,6 +234,7 @@ tpquery_out(PG_FUNCTION_ARGS)
 		/* Format with index name: "index_name:query_text" */
 		char *index_name = get_rel_name(tpquery->index_oid);
 		char *query_text = get_tpquery_text(tpquery);
+		Oid	  cfg_oid	 = get_tpquery_config_oid(tpquery);
 
 		if (index_name)
 			appendStringInfo(str, "%s:%s", index_name, query_text);
@@ -239,6 +242,15 @@ tpquery_out(PG_FUNCTION_ARGS)
 			/* Index was dropped - show OID for debugging */
 			appendStringInfo(
 					str, "[oid=%u]:%s", tpquery->index_oid, query_text);
+
+		/* Append language if query has an override */
+		if (OidIsValid(cfg_oid))
+		{
+			char *cfg_name = DatumGetCString(DirectFunctionCall1(
+					regconfigout, ObjectIdGetDatum(cfg_oid)));
+			appendStringInfo(str, ":%s", cfg_name);
+			pfree(cfg_name);
+		}
 	}
 	else
 	{
@@ -272,12 +284,12 @@ tpquery_recv(PG_FUNCTION_ARGS)
 
 	/* Read and validate version */
 	version = pq_getmsgbyte(buf);
-	if (version < 1 || version > 3)
+	if (version < 1 || version > 4)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("unsupported bm25query binary format version %u",
 						version),
-				 errhint("Expected version 1-3. This may indicate data "
+				 errhint("Expected version 1-4. This may indicate data "
 						 "from an incompatible pg_textsearch version.")));
 
 	/* Read flags for v2+ */
@@ -292,6 +304,11 @@ tpquery_recv(PG_FUNCTION_ARGS)
 	if (version >= 3)
 		tenant_id = pq_getmsgint(buf, sizeof(uint32));
 
+	/* Read query_config_oid for v4+ */
+	Oid query_config_oid = InvalidOid;
+	if (version >= 4)
+		query_config_oid = pq_getmsgint(buf, sizeof(Oid));
+
 	/* Validate length to prevent unbounded memory allocation */
 	if (query_text_len < 0 || query_text_len > 1000000) /* 1MB limit */
 		ereport(ERROR,
@@ -304,7 +321,8 @@ tpquery_recv(PG_FUNCTION_ARGS)
 
 	explicit_index = (flags & TPQUERY_FLAG_EXPLICIT_INDEX) != 0;
 	result = create_tpquery_explicit(query_text, index_oid, explicit_index);
-	result->tenant_id = tenant_id;
+	result->tenant_id		 = tenant_id;
+	result->query_config_oid = query_config_oid;
 	pfree(query_text);
 
 	PG_RETURN_POINTER(result);
@@ -328,6 +346,7 @@ tpquery_send(PG_FUNCTION_ARGS)
 	pq_sendint32(&buf, tpquery->index_oid);
 	pq_sendint32(&buf, tpquery->query_text_len);
 	pq_sendint32(&buf, tpquery->tenant_id);
+	pq_sendint32(&buf, tpquery->query_config_oid);
 
 	query_text = get_tpquery_text(tpquery);
 	pq_sendbytes(&buf, query_text, tpquery->query_text_len);
@@ -363,6 +382,38 @@ to_tpquery_text_index(PG_FUNCTION_ARGS)
 
 	pfree(query_text);
 	pfree(index_name);
+	PG_RETURN_POINTER(result);
+}
+
+/*
+ * Create a tpquery from text with index name and language override.
+ * Resolves language name to a regconfig OID for query tokenization.
+ */
+Datum
+to_tpquery_text_index_language(PG_FUNCTION_ARGS)
+{
+	text	*input_text	   = PG_GETARG_TEXT_PP(0);
+	text	*index_text	   = PG_GETARG_TEXT_PP(1);
+	text	*language_text = PG_GETARG_TEXT_PP(2);
+	char	*query_text	   = text_to_cstring(input_text);
+	char	*index_name	   = text_to_cstring(index_text);
+	char	*language_name = text_to_cstring(language_text);
+	Oid		 config_oid;
+	TpQuery *result;
+
+	/* Resolve language name to regconfig OID */
+	{
+		List *names = stringToQualifiedNameList(language_name, NULL);
+		config_oid	= get_ts_config_oid(names, false);
+		list_free(names);
+	}
+
+	result = create_tpquery_from_name(query_text, index_name);
+	result->query_config_oid = config_oid;
+
+	pfree(query_text);
+	pfree(index_name);
+	pfree(language_name);
 	PG_RETURN_POINTER(result);
 }
 
@@ -862,21 +913,32 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 			fcinfo->flinfo->fn_extra = cache;
 		}
 
-		/* Tokenize the document text using the index's text configuration */
-		tsvector_datum = DirectFunctionCall2Coll(
-				to_tsvector_byid,
-				InvalidOid, /* collation */
-				ObjectIdGetDatum(text_config_oid),
-				PointerGetDatum(text_arg));
+		/*
+		 * Determine text config for query tokenization.
+		 * If the query has a language override, use it instead of the
+		 * index's text_config_oid.
+		 */
+		{
+			Oid query_cfg		  = get_tpquery_config_oid(query);
+			Oid query_text_config = OidIsValid(query_cfg) ? query_cfg
+														  : text_config_oid;
 
-		tsvector = DatumGetTSVector(tsvector_datum);
+			/* Tokenize the document text using the index's config */
+			tsvector_datum = DirectFunctionCall2Coll(
+					to_tsvector_byid,
+					InvalidOid,
+					ObjectIdGetDatum(text_config_oid),
+					PointerGetDatum(text_arg));
 
-		/* Tokenize the query text to get query terms */
-		query_tsvector_datum = DirectFunctionCall2Coll(
-				to_tsvector_byid,
-				InvalidOid,
-				ObjectIdGetDatum(text_config_oid),
-				PointerGetDatum(cstring_to_text(query_text)));
+			tsvector = DatumGetTSVector(tsvector_datum);
+
+			/* Tokenize the query text (may use override config) */
+			query_tsvector_datum = DirectFunctionCall2Coll(
+					to_tsvector_byid,
+					InvalidOid,
+					ObjectIdGetDatum(query_text_config),
+					PointerGetDatum(cstring_to_text(query_text)));
+		}
 
 		query_tsvector		= DatumGetTSVector(query_tsvector_datum);
 		query_entries		= ARRPTR(query_tsvector);
@@ -1011,6 +1073,220 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 }
 
 /*
+ * BM25 scoring function for tsvector <@> bm25query operations.
+ *
+ * The left arg is already a tsvector, so we skip document tokenization.
+ * The query side uses the query_config_oid from the bm25query, falling
+ * back to the index's text_config_oid if not set.
+ */
+Datum
+bm25_tsvector_bm25query_score(PG_FUNCTION_ARGS)
+{
+	TSVector tsvector	= PG_GETARG_TSVECTOR(0);
+	TpQuery *query		= (TpQuery *)PG_DETOAST_DATUM(PG_GETARG_DATUM(1));
+	char	*query_text = get_tpquery_text(query);
+	Oid		 index_oid;
+
+	Relation		   index_rel = NULL;
+	TpIndexMetaPage	   metap	 = NULL;
+	Oid				   text_config_oid;
+	Datum			   query_tsvector_datum;
+	TSVector		   query_tsvector;
+	WordEntry		  *query_entries;
+	char			  *query_lexemes_start;
+	TpLocalIndexState *index_state;
+	float4			   avg_doc_len;
+	int32			   total_docs;
+	int64			   total_len;
+	float8			   result = 0.0;
+	int				   q_i;
+	float4			   doc_length;
+	int				   query_term_count;
+	QueryScoreCache	  *cache;
+	BlockNumber		   first_segment;
+	BlockNumber		   level_heads[TP_MAX_LEVELS];
+	Oid				   query_text_config;
+
+	index_oid = get_tpquery_index_oid(query);
+	index_rel = validate_and_open_index(query, &index_oid);
+
+	PG_TRY();
+	{
+		Oid query_cfg;
+
+		metap			= tp_get_metapage(index_rel);
+		text_config_oid = metap->text_config_oid;
+		first_segment	= metap->level_heads[0];
+		for (int i = 0; i < TP_MAX_LEVELS; i++)
+			level_heads[i] = metap->level_heads[i];
+
+		index_state = tp_get_local_index_state(RelationGetRelid(index_rel));
+		if (!index_state)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not get index state for "
+							"index OID %u",
+							RelationGetRelid(index_rel))));
+		}
+
+		total_docs	= index_state->shared->total_docs;
+		total_len	= index_state->shared->total_len;
+		avg_doc_len = total_docs > 0
+							? (float4)((double)total_len / (double)total_docs)
+							: 0.0f;
+
+		cache = (QueryScoreCache *)fcinfo->flinfo->fn_extra;
+		if (!cache_is_valid(cache, index_oid, first_segment, total_docs))
+		{
+			cache = (QueryScoreCache *)MemoryContextAllocZero(
+					fcinfo->flinfo->fn_mcxt, sizeof(QueryScoreCache));
+			cache->index_oid		 = index_oid;
+			cache->first_segment	 = first_segment;
+			cache->total_docs		 = total_docs;
+			cache->avg_doc_len		 = avg_doc_len;
+			cache->num_terms		 = 0;
+			fcinfo->flinfo->fn_extra = cache;
+		}
+
+		/*
+		 * Determine query tokenization config: use query override
+		 * if set, else index default, else 'english' fallback.
+		 */
+		query_cfg		  = get_tpquery_config_oid(query);
+		query_text_config = OidIsValid(query_cfg)
+								  ? query_cfg
+								  : (OidIsValid(text_config_oid)
+											 ? text_config_oid
+											 : InvalidOid);
+
+		if (!OidIsValid(query_text_config))
+		{
+			/* Fallback to 'english' for query tokenization */
+			List *names		  = stringToQualifiedNameList("english", NULL);
+			query_text_config = get_ts_config_oid(names, false);
+			list_free(names);
+		}
+
+		/* Tokenize the query text */
+		query_tsvector_datum = DirectFunctionCall2Coll(
+				to_tsvector_byid,
+				InvalidOid,
+				ObjectIdGetDatum(query_text_config),
+				PointerGetDatum(cstring_to_text(query_text)));
+
+		query_tsvector		= DatumGetTSVector(query_tsvector_datum);
+		query_entries		= ARRPTR(query_tsvector);
+		query_lexemes_start = STRPTR(query_tsvector);
+
+		/* Document length from the tsvector directly */
+		doc_length = (float4)decode_fieldnorm(
+				encode_fieldnorm((int32)calculate_doc_length(tsvector)));
+		query_term_count = query_tsvector->size;
+
+		for (q_i = 0; q_i < query_term_count; q_i++)
+		{
+			char *query_lexeme_raw = query_lexemes_start +
+									 query_entries[q_i].pos;
+			int			   lexeme_len = query_entries[q_i].len;
+			char		  *query_lexeme;
+			TpPostingList *posting_list;
+			float4		   idf;
+			float4		   tf;
+			float4		   term_score;
+			int			   query_freq;
+
+			query_lexeme = palloc(lexeme_len + 1);
+			memcpy(query_lexeme, query_lexeme_raw, lexeme_len);
+			query_lexeme[lexeme_len] = '\0';
+
+			if (query_entries[q_i].haspos)
+				query_freq = (int32)
+						POSDATALEN(query_tsvector, &query_entries[q_i]);
+			else
+				query_freq = 1;
+
+			/* Find term in the document tsvector */
+			tf = find_term_frequency(
+					tsvector, &query_entries[q_i], query_lexeme);
+
+			if (tf == 0.0f)
+			{
+				pfree(query_lexeme);
+				continue;
+			}
+
+			/* Get or compute IDF */
+			{
+				uint32 cached_doc_freq = 0;
+				idf = lookup_cached_idf(cache, query_lexeme, &cached_doc_freq);
+
+				if (idf < 0.0f)
+				{
+					uint32 unified_doc_freq	 = 0;
+					uint32 memtable_doc_freq = 0;
+					uint32 segment_doc_freq	 = 0;
+
+					posting_list =
+							tp_get_posting_list(index_state, query_lexeme);
+					if (posting_list && posting_list->doc_count > 0)
+						memtable_doc_freq = posting_list->doc_count;
+
+					for (int level = 0; level < TP_MAX_LEVELS; level++)
+					{
+						if (level_heads[level] != InvalidBlockNumber)
+						{
+							segment_doc_freq += tp_segment_get_doc_freq(
+									index_rel,
+									level_heads[level],
+									query_lexeme);
+						}
+					}
+
+					unified_doc_freq = memtable_doc_freq + segment_doc_freq;
+					if (unified_doc_freq == 0)
+					{
+						pfree(query_lexeme);
+						continue;
+					}
+
+					idf = tp_calculate_idf(unified_doc_freq, total_docs);
+					cache_term_idf(cache, query_lexeme, unified_doc_freq, idf);
+				}
+			}
+
+			term_score = calculate_term_score(
+					tf,
+					idf,
+					doc_length,
+					avg_doc_len,
+					metap->k1,
+					metap->b,
+					query_freq);
+
+			result += term_score;
+			pfree(query_lexeme);
+		}
+
+		pfree(metap);
+		metap = NULL;
+		index_close(index_rel, AccessShareLock);
+		index_rel = NULL;
+	}
+	PG_CATCH();
+	{
+		if (metap)
+			pfree(metap);
+		if (index_rel)
+			index_close(index_rel, AccessShareLock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	PG_RETURN_FLOAT8((result > 0) ? -result : result);
+}
+
+/*
  * tpquery equality function
  */
 Datum
@@ -1060,6 +1336,7 @@ create_tpquery_explicit(
 	result->index_oid	   = index_oid;
 	result->query_text_len = query_text_len;
 	result->tenant_id	   = 0;
+	result->query_config_oid = InvalidOid;
 
 	/* Copy query text */
 	memcpy(result->data, query_text, query_text_len);
@@ -1158,6 +1435,18 @@ get_tpquery_tenant_id(TpQuery *tpquery)
 	if (tpquery->version < 3)
 		return 0;
 	return tpquery->tenant_id;
+}
+
+/*
+ * Get query config OID from tpquery (InvalidOid = use index default)
+ */
+Oid
+get_tpquery_config_oid(TpQuery *tpquery)
+{
+	/* Version < 4 didn't have query_config_oid */
+	if (tpquery->version < 4)
+		return InvalidOid;
+	return tpquery->query_config_oid;
 }
 
 /*

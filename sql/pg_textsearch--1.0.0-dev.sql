@@ -85,6 +85,11 @@ RETURNS bm25query
 AS 'MODULE_PATHNAME', 'to_tpquery_text_index'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
+CREATE FUNCTION to_bm25query(input_text text, index_name text, language text)
+RETURNS bm25query
+AS 'MODULE_PATHNAME', 'to_tpquery_text_index_language'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
 
 -- Equality function: bm25vector = bm25vector → boolean
 CREATE FUNCTION bm25vector_eq(bm25vector, bm25vector)
@@ -166,6 +171,28 @@ CREATE OPERATOR CLASS text_bm25_ops
 DEFAULT FOR TYPE text USING bm25 AS
     OPERATOR    1   <@> (text, bm25query) FOR ORDER BY float_ops,
     FUNCTION    8   (text, bm25query)   bm25_text_bm25query_score(text, bm25query);
+
+-- BM25 scoring function for tsvector <@> bm25query operations
+-- For pre-tokenized tsvector columns: skips document tokenization entirely.
+-- COST 1000: Standalone scoring still opens index for IDF lookups.
+CREATE FUNCTION bm25_tsvector_bm25query_score(tsvector, bm25query)
+RETURNS float8
+AS 'MODULE_PATHNAME', 'bm25_tsvector_bm25query_score'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 1000;
+
+-- <@> operator for tsvector <@> bm25query operations
+CREATE OPERATOR <@> (
+    LEFTARG = tsvector,
+    RIGHTARG = bm25query,
+    PROCEDURE = bm25_tsvector_bm25query_score
+);
+
+-- bm25 operator class for tsvector columns
+-- Users must use explicit to_bm25query() with language parameter.
+CREATE OPERATOR CLASS tsvector_bm25_ops
+DEFAULT FOR TYPE tsvector USING bm25 AS
+    OPERATOR    1   <@> (tsvector, bm25query) FOR ORDER BY float_ops,
+    FUNCTION    8   (tsvector, bm25query)   bm25_tsvector_bm25query_score(tsvector, bm25query);
 
 -- Debug function to dump index contents (memtable and segments)
 -- Single argument version returns truncated output as text

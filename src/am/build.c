@@ -305,29 +305,20 @@ tp_build_extract_options(
 				list_free(names);
 			}
 		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("text_config parameter is required for bm25 "
-							"indexes"),
-					 errhint("Specify text_config when creating the index: "
-							 "CREATE INDEX ... USING "
-							 "bm25(column) WITH (text_config='english')")));
-		}
+		/* text_config is optional - may be omitted for tsvector indexes */
 
 		*k1 = options->k1;
 		*b	= options->b;
 	}
 	else
 	{
-		/* No options provided - require text_config */
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("text_config parameter is required for bm25 indexes"),
-				 errhint("Specify text_config when creating the index: "
-						 "CREATE INDEX ... USING "
-						 "bm25(column) WITH (text_config='english')")));
+		/*
+		 * No options provided at all. Set defaults for k1/b.
+		 * text_config_oid stays InvalidOid; the caller will validate
+		 * that this is acceptable for the indexed column type.
+		 */
+		*k1 = TP_DEFAULT_K1;
+		*b	= TP_DEFAULT_B;
 	}
 }
 
@@ -336,7 +327,11 @@ tp_build_extract_options(
  */
 static void
 tp_build_init_metapage(
-		Relation index, Oid text_config_oid, double k1, double b)
+		Relation index,
+		Oid		 text_config_oid,
+		double	 k1,
+		double	 b,
+		uint8	 indexed_type)
 {
 	Buffer			metabuf;
 	Page			metapage;
@@ -348,7 +343,7 @@ tp_build_init_metapage(
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 	metapage = BufferGetPage(metabuf);
 
-	tp_init_metapage(metapage, text_config_oid);
+	tp_init_metapage(metapage, text_config_oid, indexed_type);
 	metap	  = (TpIndexMetaPage)PageGetContents(metapage);
 	metap->k1 = k1;
 	metap->b  = b;
@@ -662,6 +657,65 @@ tp_process_document_text(
 }
 
 /*
+ * Core document processing for pre-tokenized tsvector columns.
+ * Extracts terms directly from the TSVector without tokenization.
+ */
+bool
+tp_process_document_tsvector(
+		TSVector		   tsvector,
+		ItemPointer		   ctid,
+		TpLocalIndexState *index_state,
+		Relation		   index_rel,
+		int32			  *doc_length_out,
+		uint32			   tenant_id)
+{
+	char **terms;
+	int32 *frequencies;
+	int	   term_count;
+	int	   doc_length;
+
+	if (!tsvector || !index_state)
+		return false;
+
+	if (!ItemPointerIsValid(ctid))
+	{
+		elog(WARNING,
+			 "Invalid TID during tsvector processing, "
+			 "skipping document");
+		return false;
+	}
+
+	/* Extract lexemes and frequencies from TSVector */
+	doc_length = tp_extract_terms_from_tsvector(
+			tsvector, &terms, &frequencies, &term_count);
+
+	if (term_count > 0)
+	{
+		tp_acquire_index_lock(index_state, LW_EXCLUSIVE);
+
+		tp_add_document_terms(
+				index_state,
+				ctid,
+				terms,
+				frequencies,
+				term_count,
+				doc_length,
+				tenant_id);
+
+		if (index_rel != NULL)
+			tp_auto_spill_if_needed(index_state, index_rel);
+
+		tp_free_terms_array(terms, term_count);
+		pfree(frequencies);
+	}
+
+	if (doc_length_out)
+		*doc_length_out = doc_length;
+
+	return true;
+}
+
+/*
  * Process a single document during index build
  * Returns true if document was processed successfully, false to skip
  */
@@ -673,23 +727,20 @@ tp_process_document(
 		TpLocalIndexState *index_state,
 		Relation		   index,
 		uint64			  *total_docs,
-		AttrNumber		   tenant_attnum)
+		AttrNumber		   tenant_attnum,
+		uint8			   indexed_type)
 {
 	bool		isnull;
-	Datum		text_datum;
-	text	   *document_text;
+	Datum		col_datum;
 	ItemPointer ctid;
 	int32		doc_length;
 	uint32		tenant_id = 0;
 
-	/* Get the text column value (first indexed column) */
-	text_datum =
-			slot_getattr(slot, indexInfo->ii_IndexAttrNumbers[0], &isnull);
+	/* Get the column value (first indexed column) */
+	col_datum = slot_getattr(slot, indexInfo->ii_IndexAttrNumbers[0], &isnull);
 
 	if (isnull)
 		return false; /* Skip NULL documents */
-
-	document_text = DatumGetTextPP(text_datum);
 
 	/* Ensure the slot is materialized to get the TID */
 	slot_getallattrs(slot);
@@ -704,17 +755,38 @@ tp_process_document(
 			tenant_id = DatumGetUInt32(tenant_datum);
 	}
 
-	/* Process the document text using shared helper */
-	if (!tp_process_document_text(
-				document_text,
-				ctid,
-				text_config_oid,
-				index_state,
-				index,
-				&doc_length,
-				tenant_id))
+	if (indexed_type == TP_INDEXED_TYPE_TSVECTOR)
 	{
-		return false;
+		/* tsvector column: skip tokenization */
+		TSVector tsvector = DatumGetTSVectorCopy(col_datum);
+
+		if (!tp_process_document_tsvector(
+					tsvector,
+					ctid,
+					index_state,
+					index,
+					&doc_length,
+					tenant_id))
+		{
+			return false;
+		}
+	}
+	else
+	{
+		/* text column: tokenize with text_config */
+		text *document_text = DatumGetTextPP(col_datum);
+
+		if (!tp_process_document_text(
+					document_text,
+					ctid,
+					text_config_oid,
+					index_state,
+					index,
+					&doc_length,
+					tenant_id))
+		{
+			return false;
+		}
 	}
 
 	/*
@@ -744,6 +816,7 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	uint64			   total_len  = 0;
 	TpLocalIndexState *index_state;
 	AttrNumber		   tenant_attnum = InvalidAttrNumber;
+	uint8			   indexed_type	 = TP_INDEXED_TYPE_TEXT;
 
 	/* BM25 index build started */
 	elog(NOTICE,
@@ -779,13 +852,45 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	tp_build_extract_options(
 			index, &text_config_name, &text_config_oid, &k1, &b);
 
+	/*
+	 * Determine indexed column type. If the column is tsvector,
+	 * text_config is optional. For text columns, it's required.
+	 */
+	{
+		AttrNumber attnum	= indexInfo->ii_IndexAttrNumbers[0];
+		Oid		   col_type = get_atttype(RelationGetRelid(heap), attnum);
+
+		if (col_type == TSVECTOROID)
+		{
+			indexed_type = TP_INDEXED_TYPE_TSVECTOR;
+		}
+		else
+		{
+			indexed_type = TP_INDEXED_TYPE_TEXT;
+			/* text_config is required for text columns */
+			if (!OidIsValid(text_config_oid))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("text_config parameter is required for "
+								"bm25 indexes on text columns"),
+						 errhint("Specify text_config when creating the "
+								 "index: CREATE INDEX ... USING "
+								 "bm25(column) WITH "
+								 "(text_config='english')")));
+			}
+		}
+	}
+
 	/* Log configuration being used */
 	if (text_config_name)
 		elog(NOTICE, "Using text search configuration: %s", text_config_name);
+	else if (indexed_type == TP_INDEXED_TYPE_TSVECTOR)
+		elog(NOTICE, "Indexing tsvector column (no text_config needed)");
 	elog(NOTICE, "Using index options: k1=%.2f, b=%.2f", k1, b);
 
 	/* Initialize metapage */
-	tp_build_init_metapage(index, text_config_oid, k1, b);
+	tp_build_init_metapage(index, text_config_oid, k1, b, indexed_type);
 
 	/*
 	 * Resolve tenant column if configured.
@@ -893,7 +998,8 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 					k1,
 					b,
 					nworkers,
-					tenant_attnum);
+					tenant_attnum,
+					indexed_type);
 		}
 
 		if (reltuples >= TP_WARN_NO_PARALLEL_TUPLES && nworkers == 0)
@@ -947,7 +1053,8 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 				index_state,
 				index,
 				&total_docs,
-				tenant_attnum);
+				tenant_attnum,
+				indexed_type);
 
 		/* Report progress every TP_PROGRESS_REPORT_INTERVAL tuples */
 		if (total_docs % TP_PROGRESS_REPORT_INTERVAL == 0)
@@ -1092,41 +1199,18 @@ tp_buildempty(Relation index)
 
 	/* Extract options from index */
 	options = (TpOptions *)index->rd_options;
-	if (options)
+	if (options && options->text_config_offset > 0)
 	{
-		if (options->text_config_offset > 0)
+		text_config_name = pstrdup(
+				(char *)options + options->text_config_offset);
 		{
-			text_config_name = pstrdup(
-					(char *)options + options->text_config_offset);
-			{
-				List *names =
-						stringToQualifiedNameList(text_config_name, NULL);
+			List *names = stringToQualifiedNameList(text_config_name, NULL);
 
-				text_config_oid = get_ts_config_oid(names, false);
-				list_free(names);
-			}
-		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("text_config parameter is required for bm25 "
-							"indexes"),
-					 errhint("Specify text_config when creating the index: "
-							 "CREATE INDEX ... USING "
-							 "bm25(column) WITH (text_config='english')")));
+			text_config_oid = get_ts_config_oid(names, false);
+			list_free(names);
 		}
 	}
-	else
-	{
-		/* No options provided - require text_config */
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("text_config parameter is required for bm25 indexes"),
-				 errhint("Specify text_config when creating the index: "
-						 "CREATE INDEX ... USING "
-						 "bm25(column) WITH (text_config='english')")));
-	}
+	/* text_config is optional for tsvector indexes */
 
 	/* Create and initialize the metapage */
 	metabuf = ReadBufferExtended(index, INIT_FORKNUM, P_NEW, RBM_NORMAL, NULL);
@@ -1134,7 +1218,7 @@ tp_buildempty(Relation index)
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 
 	metapage = BufferGetPage(metabuf);
-	tp_init_metapage(metapage, text_config_oid);
+	tp_init_metapage(metapage, text_config_oid, TP_INDEXED_TYPE_TEXT);
 
 	/* Set additional parameters after init */
 	metap	  = (TpIndexMetaPage)PageGetContents(metapage);
@@ -1163,15 +1247,9 @@ tp_insert(
 		bool			 indexUnchanged,
 		IndexInfo		*indexInfo)
 {
-	text			  *document_text;
-	Datum			   vector_datum;
-	TpVector		  *tpvec;
-	TpVectorEntry	  *vector_entry;
-	int32			  *frequencies;
-	int				   term_count;
-	int				   doc_length = 0;
-	int				   i;
 	TpLocalIndexState *index_state;
+	TpIndexMetaPage	   metap;
+	uint8			   indexed_type;
 
 	(void)checkUnique;	  /* unused */
 	(void)indexUnchanged; /* unused */
@@ -1190,121 +1268,162 @@ tp_insert(
 	 * write transactions with respect to reads.
 	 */
 	if (index_state != NULL)
-	{
 		tp_acquire_index_lock(index_state, LW_EXCLUSIVE);
-	}
 
-	/* Extract text from first column */
-	document_text = DatumGetTextPP(values[0]);
+	/* Read indexed_type from metapage */
+	metap		 = tp_get_metapage(index);
+	indexed_type = metap->indexed_type;
 
-	/* Vectorize the document */
+	if (indexed_type == TP_INDEXED_TYPE_TSVECTOR)
 	{
-		char *index_name;
-		char *schema_name;
-		Oid	  namespace_oid = RelationGetNamespace(index);
+		/* tsvector column: extract terms directly */
+		TSVector tsvector  = DatumGetTSVectorCopy(values[0]);
+		uint32	 tenant_id = 0;
 
-		schema_name = get_namespace_name(namespace_oid);
-		index_name =
-				psprintf("%s.%s", schema_name, RelationGetRelationName(index));
-
-		vector_datum = DirectFunctionCall2(
-				to_tpvector,
-				PointerGetDatum(document_text),
-				CStringGetTextDatum(index_name));
-
-		pfree(index_name);
-	}
-	tpvec = (TpVector *)DatumGetPointer(vector_datum);
-
-	/* Extract term IDs and frequencies from tpvector */
-	term_count = tpvec->entry_count;
-	if (term_count > 0)
-	{
-		char **terms = palloc(term_count * sizeof(char *));
-
-		frequencies = palloc(term_count * sizeof(int32));
-
-		vector_entry = TPVECTOR_ENTRIES_PTR(tpvec);
-		for (i = 0; i < term_count; i++)
+		/* Extract tenant_id if configured */
+		if (metap->tenant_column_attno != 0)
 		{
-			char *lexeme;
+			AttrNumber tattno = (AttrNumber)metap->tenant_column_attno;
 
-			/* Always allocate on heap for terms array */
-			lexeme = palloc(vector_entry->lexeme_len + 1);
-			memcpy(lexeme, vector_entry->lexeme, vector_entry->lexeme_len);
-			lexeme[vector_entry->lexeme_len] = '\0';
-
-			/* Store the lexeme string directly in terms array */
-			terms[i]	   = lexeme;
-			frequencies[i] = vector_entry->frequency;
-			doc_length += vector_entry->frequency;
-
-			vector_entry = get_tpvector_next_entry(vector_entry);
-		}
-
-		/* Add document terms to posting lists (if shared memory available) */
-		if (index_state != NULL)
-		{
-			/* Validate TID before adding to posting list */
-			if (!ItemPointerIsValid(ht_ctid))
-				elog(WARNING, "Invalid TID in tp_insert, skipping");
-			else
+			if (tattno != InvalidAttrNumber)
 			{
-				/*
-				 * Extract tenant_id from heap tuple if tenant column
-				 * is configured. We read the metapage to get the
-				 * stored attnum.
-				 */
-				uint32 tenant_id = 0;
+				TupleTableSlot *slot;
+				bool			got;
+
+				slot = table_slot_create(heapRel, NULL);
+				got	 = table_tuple_fetch_row_version(
+						 heapRel, ht_ctid, SnapshotAny, slot);
+				if (got)
 				{
-					TpOptions *opts = (TpOptions *)index->rd_options;
-					if (opts && opts->tenant_column_offset > 0)
-					{
-						TpIndexMetaPage metap  = tp_get_metapage(index);
-						AttrNumber		tattno = (AttrNumber)
-													metap->tenant_column_attno;
-						pfree(metap);
-
-						if (tattno != InvalidAttrNumber)
-						{
-							TupleTableSlot *slot;
-							bool			got;
-
-							slot = table_slot_create(heapRel, NULL);
-							got	 = table_tuple_fetch_row_version(
-									 heapRel, ht_ctid, SnapshotAny, slot);
-							if (got)
-							{
-								bool  tisnull;
-								Datum tdatum =
-										slot_getattr(slot, tattno, &tisnull);
-								if (!tisnull)
-									tenant_id = DatumGetUInt32(tdatum);
-							}
-							ExecDropSingleTupleTableSlot(slot);
-						}
-					}
+					bool  tisnull;
+					Datum tdatum = slot_getattr(slot, tattno, &tisnull);
+					if (!tisnull)
+						tenant_id = DatumGetUInt32(tdatum);
 				}
-
-				tp_add_document_terms(
-						index_state,
-						ht_ctid,
-						terms,
-						frequencies,
-						term_count,
-						doc_length,
-						tenant_id);
-
-				/* Auto-spill if memory limit exceeded */
-				tp_auto_spill_if_needed(index_state, index);
+				ExecDropSingleTupleTableSlot(slot);
 			}
 		}
 
-		/* Free the terms array and individual lexemes */
-		for (i = 0; i < term_count; i++)
-			pfree(terms[i]);
-		pfree(terms);
-		pfree(frequencies);
+		pfree(metap);
+
+		if (index_state != NULL && ItemPointerIsValid(ht_ctid))
+		{
+			tp_process_document_tsvector(
+					tsvector, ht_ctid, index_state, index, NULL, tenant_id);
+		}
+	}
+	else
+	{
+		/* text column: vectorize using index's text config */
+		text		  *document_text = DatumGetTextPP(values[0]);
+		Datum		   vector_datum;
+		TpVector	  *tpvec;
+		TpVectorEntry *vector_entry;
+		int32		  *frequencies;
+		int			   term_count;
+		int			   doc_length = 0;
+		int			   i;
+
+		pfree(metap);
+
+		/* Vectorize the document */
+		{
+			char *index_name;
+			char *schema_name;
+			Oid	  namespace_oid = RelationGetNamespace(index);
+
+			schema_name = get_namespace_name(namespace_oid);
+			index_name	= psprintf(
+					 "%s.%s", schema_name, RelationGetRelationName(index));
+
+			vector_datum = DirectFunctionCall2(
+					to_tpvector,
+					PointerGetDatum(document_text),
+					CStringGetTextDatum(index_name));
+
+			pfree(index_name);
+		}
+		tpvec = (TpVector *)DatumGetPointer(vector_datum);
+
+		/* Extract term IDs and frequencies from tpvector */
+		term_count = tpvec->entry_count;
+		if (term_count > 0)
+		{
+			char **terms = palloc(term_count * sizeof(char *));
+
+			frequencies = palloc(term_count * sizeof(int32));
+
+			vector_entry = TPVECTOR_ENTRIES_PTR(tpvec);
+			for (i = 0; i < term_count; i++)
+			{
+				char *lexeme;
+
+				lexeme = palloc(vector_entry->lexeme_len + 1);
+				memcpy(lexeme, vector_entry->lexeme, vector_entry->lexeme_len);
+				lexeme[vector_entry->lexeme_len] = '\0';
+
+				terms[i]	   = lexeme;
+				frequencies[i] = vector_entry->frequency;
+				doc_length += vector_entry->frequency;
+
+				vector_entry = get_tpvector_next_entry(vector_entry);
+			}
+
+			if (index_state != NULL)
+			{
+				if (!ItemPointerIsValid(ht_ctid))
+					elog(WARNING, "Invalid TID in tp_insert, skipping");
+				else
+				{
+					uint32 tenant_id = 0;
+					{
+						TpOptions *opts = (TpOptions *)index->rd_options;
+						if (opts && opts->tenant_column_offset > 0)
+						{
+							TpIndexMetaPage mp = tp_get_metapage(index);
+							AttrNumber		tattno =
+									(AttrNumber)mp->tenant_column_attno;
+							pfree(mp);
+
+							if (tattno != InvalidAttrNumber)
+							{
+								TupleTableSlot *slot;
+								bool			got;
+
+								slot = table_slot_create(heapRel, NULL);
+								got	 = table_tuple_fetch_row_version(
+										 heapRel, ht_ctid, SnapshotAny, slot);
+								if (got)
+								{
+									bool  tisnull;
+									Datum tdatum = slot_getattr(
+											slot, tattno, &tisnull);
+									if (!tisnull)
+										tenant_id = DatumGetUInt32(tdatum);
+								}
+								ExecDropSingleTupleTableSlot(slot);
+							}
+						}
+					}
+
+					tp_add_document_terms(
+							index_state,
+							ht_ctid,
+							terms,
+							frequencies,
+							term_count,
+							doc_length,
+							tenant_id);
+
+					tp_auto_spill_if_needed(index_state, index);
+				}
+			}
+
+			for (i = 0; i < term_count; i++)
+				pfree(terms[i]);
+			pfree(terms);
+			pfree(frequencies);
+		}
 	}
 
 	/* Store the docid for crash recovery */

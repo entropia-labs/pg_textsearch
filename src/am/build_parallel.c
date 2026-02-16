@@ -68,7 +68,8 @@ static void tp_init_parallel_shared(
 		double				   k1,
 		double				   b,
 		int					   nworkers,
-		dsa_area			  *dsa);
+		dsa_area			  *dsa,
+		uint8				   indexed_type);
 
 static void tp_leader_process_buffers(
 		TpParallelBuildShared *shared,
@@ -88,7 +89,8 @@ static void tp_worker_process_document(
 		TupleTableSlot		   *slot,
 		int						attnum,
 		Oid						text_config_oid,
-		AttrNumber				tenant_attnum);
+		AttrNumber				tenant_attnum,
+		uint8					indexed_type);
 
 static dshash_table *tp_worker_create_string_table(dsa_area *dsa);
 static dshash_table *tp_worker_create_doclength_table(dsa_area *dsa);
@@ -132,7 +134,8 @@ tp_build_parallel(
 		double	   k1,
 		double	   b,
 		int		   nworkers,
-		AttrNumber tenant_attnum)
+		AttrNumber tenant_attnum,
+		uint8	   indexed_type)
 {
 	IndexBuildResult	  *result;
 	ParallelContext		  *pcxt;
@@ -198,7 +201,8 @@ tp_build_parallel(
 			k1,
 			b,
 			nworkers,
-			dsa);
+			dsa,
+			indexed_type);
 
 	/* Initialize parallel table scan */
 	table_parallelscan_initialize(heap, TpParallelTableScan(shared), snapshot);
@@ -399,7 +403,8 @@ tp_init_parallel_shared(
 		double				   k1,
 		double				   b,
 		int					   nworkers,
-		dsa_area			  *dsa)
+		dsa_area			  *dsa,
+		uint8				   indexed_type)
 {
 	TpWorkerState *worker_states;
 	int			   i;
@@ -414,6 +419,7 @@ tp_init_parallel_shared(
 	shared->tenant_attnum	= tenant_attnum;
 	shared->k1				= k1;
 	shared->b				= b;
+	shared->indexed_type	= indexed_type;
 	shared->nworkers		= nworkers;
 
 	/* DSA handle for workers to attach */
@@ -569,7 +575,8 @@ tp_parallel_build_worker_main(
 				slot,
 				shared->attnum,
 				shared->text_config_oid,
-				shared->tenant_attnum);
+				shared->tenant_attnum,
+				shared->indexed_type);
 
 		pg_atomic_fetch_add_u64(&my_state->tuples_scanned, 1);
 
@@ -2344,13 +2351,12 @@ tp_worker_process_document(
 		TupleTableSlot		   *slot,
 		int						attnum,
 		Oid						text_config_oid,
-		AttrNumber				tenant_attnum)
+		AttrNumber				tenant_attnum,
+		uint8					indexed_type)
 {
 	bool		  isnull;
-	Datum		  text_datum;
-	text		 *document_text;
+	Datum		  col_datum;
 	ItemPointer	  ctid;
-	Datum		  tsvector_datum;
 	TSVector	  tsvector;
 	int32		  doc_length = 0;
 	WordEntry	 *we;
@@ -2359,13 +2365,12 @@ tp_worker_process_document(
 	dshash_table *doclength_table;
 	uint32		  tenant_id = 0;
 
-	/* Get text value */
-	text_datum = slot_getattr(slot, attnum, &isnull);
+	/* Get column value */
+	col_datum = slot_getattr(slot, attnum, &isnull);
 	if (isnull)
 		return;
 
-	document_text = DatumGetTextP(text_datum);
-	ctid		  = &slot->tts_tid;
+	ctid = &slot->tts_tid;
 
 	if (!ItemPointerIsValid(ctid))
 		return;
@@ -2379,13 +2384,24 @@ tp_worker_process_document(
 			tenant_id = DatumGetUInt32(tenant_datum);
 	}
 
-	/* Tokenize document */
-	tsvector_datum = DirectFunctionCall2Coll(
-			to_tsvector_byid,
-			InvalidOid,
-			ObjectIdGetDatum(text_config_oid),
-			PointerGetDatum(document_text));
-	tsvector = DatumGetTSVector(tsvector_datum);
+	if (indexed_type == TP_INDEXED_TYPE_TSVECTOR)
+	{
+		/* tsvector column: already tokenized */
+		tsvector = DatumGetTSVectorCopy(col_datum);
+	}
+	else
+	{
+		/* text column: tokenize with text_config */
+		text *document_text = DatumGetTextP(col_datum);
+		Datum tsvector_datum;
+
+		tsvector_datum = DirectFunctionCall2Coll(
+				to_tsvector_byid,
+				InvalidOid,
+				ObjectIdGetDatum(text_config_oid),
+				PointerGetDatum(document_text));
+		tsvector = DatumGetTSVector(tsvector_datum);
+	}
 
 	if (tsvector->size == 0)
 		return;

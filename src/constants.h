@@ -19,12 +19,15 @@
  * Page format versions - bump when on-disk format changes.
  * Each page type has its own version for independent evolution.
  */
-#define TP_METAPAGE_VERSION \
-	6 /* Bumped for multi-tenant support (V4 segments) */
+#define TP_METAPAGE_VERSION	  7 /* Bumped for tsvector column support */
 #define TP_DOCID_PAGE_VERSION 1 /* Initial version */
 #define TP_PAGE_INDEX_VERSION 1 /* Page index format version */
 
 #define TP_METAPAGE_BLKNO 0
+
+/* Indexed column type constants (stored in metapage) */
+#define TP_INDEXED_TYPE_TEXT	 0
+#define TP_INDEXED_TYPE_TSVECTOR 1
 
 /* Segment hierarchy configuration */
 #define TP_MAX_LEVELS				  8 /* Supports 8^8 = 16M segments */

@@ -65,7 +65,7 @@ tp_invalidate_docid_cache(void)
  * Initialize Tapir index metapage
  */
 void
-tp_init_metapage(Page page, Oid text_config_oid)
+tp_init_metapage(Page page, Oid text_config_oid, uint8 indexed_type)
 {
 	TpIndexMetaPage metap;
 	PageHeader		phdr;
@@ -96,6 +96,9 @@ tp_init_metapage(Page page, Oid text_config_oid)
 	/* V6: multi-tenant fields */
 	metap->tenant_column_attno	   = 0; /* 0 = no tenancy */
 	metap->first_tenant_stats_page = InvalidBlockNumber;
+
+	/* V7: tsvector column support */
+	metap->indexed_type = indexed_type;
 
 	/* Update page header to reflect that we've used space for metapage */
 	phdr		   = (PageHeader)page;

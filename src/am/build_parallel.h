@@ -102,6 +102,7 @@ typedef struct TpParallelBuildShared
 								   (InvalidAttrNumber if none) */
 	double k1;					/* BM25 k1 parameter */
 	double b;					/* BM25 b parameter */
+	uint8  indexed_type;		/* TP_INDEXED_TYPE_TEXT or _TSVECTOR */
 	int32  nworkers;			/* Number of background workers (not including
 								   leader) */
 
@@ -163,7 +164,8 @@ extern struct IndexBuildResult *tp_build_parallel(
 		double			  k1,
 		double			  b,
 		int				  nworkers,
-		AttrNumber		  tenant_attnum);
+		AttrNumber		  tenant_attnum,
+		uint8			  indexed_type);
 
 /* Worker entry point (called by parallel infrastructure) */
 extern PGDLLEXPORT void

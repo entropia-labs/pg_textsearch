@@ -398,12 +398,13 @@ tp_rescan_process_orderby(
 			}
 			else
 			{
-				/* bm25query - extract query text, index OID, tenant */
+				/* bm25query - extract query text, index OID, tenant, config */
 				TpQuery *query = (TpQuery *)DatumGetPointer(query_datum);
 
-				query_cstr		= pstrdup(get_tpquery_text(query));
-				query_index_oid = get_tpquery_index_oid(query);
-				so->tenant_id	= get_tpquery_tenant_id(query);
+				query_cstr			 = pstrdup(get_tpquery_text(query));
+				query_index_oid		 = get_tpquery_index_oid(query);
+				so->tenant_id		 = get_tpquery_tenant_id(query);
+				so->query_config_oid = get_tpquery_config_oid(query);
 
 				elog(DEBUG1,
 					 "BM25 rescan: tenant_id=%u, index_oid=%u, "
@@ -646,18 +647,75 @@ tp_execute_scoring_query(IndexScanDesc scan)
 	{
 		/*
 		 * We have a text query - convert it to a vector using the index.
+		 * If query_config_oid is set, use it for tokenization instead
+		 * of the index's text_config.
 		 */
 		char *index_name = tp_get_qualified_index_name(scan->indexRelation);
 
-		text *index_name_text  = cstring_to_text(index_name);
-		text *query_text_datum = cstring_to_text(so->query_text);
+		if (OidIsValid(so->query_config_oid))
+		{
+			/*
+			 * Use the query-specified language config. Tokenize the
+			 * query text directly and build a TpVector from it.
+			 */
+			Datum	   tsv_datum;
+			TSVector   tsv;
+			WordEntry *we;
+			int		   nterms, i;
+			char	 **lexemes;
+			int32	  *freqs;
 
-		Datum query_vec_datum = DirectFunctionCall2(
-				to_tpvector,
-				PointerGetDatum(query_text_datum),
-				PointerGetDatum(index_name_text));
+			tsv_datum = DirectFunctionCall2Coll(
+					to_tsvector_byid,
+					InvalidOid,
+					ObjectIdGetDatum(so->query_config_oid),
+					PointerGetDatum(cstring_to_text(so->query_text)));
+			tsv	   = DatumGetTSVector(tsv_datum);
+			nterms = tsv->size;
 
-		query_vector = (TpVector *)DatumGetPointer(query_vec_datum);
+			if (nterms > 0)
+			{
+				we		= ARRPTR(tsv);
+				lexemes = palloc(nterms * sizeof(char *));
+				freqs	= palloc(nterms * sizeof(int32));
+				for (i = 0; i < nterms; i++)
+				{
+					char *start = STRPTR(tsv) + we[i].pos;
+					int	  len	= we[i].len;
+					lexemes[i]	= palloc(len + 1);
+					memcpy(lexemes[i], start, len);
+					lexemes[i][len] = '\0';
+					if (we[i].haspos)
+						freqs[i] = (int32)POSDATALEN(tsv, &we[i]);
+					else
+						freqs[i] = 1;
+				}
+				query_vector = create_tpvector_from_strings(
+						index_name, nterms, (const char **)lexemes, freqs);
+				for (i = 0; i < nterms; i++)
+					pfree(lexemes[i]);
+				pfree(lexemes);
+				pfree(freqs);
+			}
+			else
+			{
+				query_vector = create_tpvector_from_strings(
+						index_name, 0, NULL, NULL);
+			}
+		}
+		else
+		{
+			/* Default: use the index's text_config via to_tpvector */
+			text *index_name_text  = cstring_to_text(index_name);
+			text *query_text_datum = cstring_to_text(so->query_text);
+
+			Datum query_vec_datum = DirectFunctionCall2(
+					to_tpvector,
+					PointerGetDatum(query_text_datum),
+					PointerGetDatum(index_name_text));
+
+			query_vector = (TpVector *)DatumGetPointer(query_vec_datum);
+		}
 
 		/* Free existing query vector if present */
 		if (so->query_vector)

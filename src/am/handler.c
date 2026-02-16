@@ -11,6 +11,7 @@
 #include <access/reloptions.h>
 #include <catalog/pg_opclass.h>
 #include <commands/vacuum.h>
+#include <tsearch/ts_type.h>
 #include <utils/syscache.h>
 
 #include "am.h"
@@ -175,13 +176,14 @@ tp_validate(Oid opclassoid)
 	{
 	case TEXTOID:
 	case VARCHAROID:
-	case BPCHAROID: /* char(n) */
+	case BPCHAROID:	  /* char(n) */
+	case TSVECTOROID: /* pre-tokenized tsvector */
 		result = true;
 		break;
 	default:
 		elog(WARNING,
-			 "Tapir index can only be created on text, varchar, or char "
-			 "columns (got type OID %u)",
+			 "Tapir index can only be created on text, varchar, char, "
+			 "or tsvector columns (got type OID %u)",
 			 opcintype);
 		result = false;
 		break;

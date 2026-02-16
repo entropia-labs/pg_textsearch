@@ -54,6 +54,9 @@ typedef struct TpIndexMetaPageData
 	uint32 tenant_column_attno;			 /* Attribute number of tenant column
 										  * (0 = no tenancy) */
 	BlockNumber first_tenant_stats_page; /* First page of tenant stats chain */
+
+	/* V7 extensions: tsvector column support */
+	uint8 indexed_type; /* 0 = text, 1 = tsvector */
 } TpIndexMetaPageData;
 
 typedef TpIndexMetaPageData *TpIndexMetaPage;
@@ -74,7 +77,8 @@ typedef struct TpDocidPageHeader
 /*
  * Metapage operations
  */
-extern void			   tp_init_metapage(Page page, Oid text_config_oid);
+extern void
+tp_init_metapage(Page page, Oid text_config_oid, uint8 indexed_type);
 extern TpIndexMetaPage tp_get_metapage(Relation index);
 extern void
 tp_update_metapage_stats(Relation index, int32 doc_delta, int64 len_delta);

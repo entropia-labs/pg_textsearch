@@ -12,6 +12,7 @@
 #include <access/reloptions.h>
 #include <storage/block.h>
 #include <storage/bufpage.h>
+#include <tsearch/ts_type.h>
 
 #include "state/state.h"
 #include "types/vector.h"
@@ -41,6 +42,10 @@ typedef struct TpScanOpaqueData
 
 	/* Tenant filtering */
 	uint32 tenant_id; /* Tenant ID filter (0 = no filter) */
+
+	/* Query language override */
+	Oid query_config_oid; /* Override text config for query tokenization
+						   * (InvalidOid = use index default) */
 } TpScanOpaqueData;
 
 typedef TpScanOpaqueData *TpScanOpaque;
@@ -105,11 +110,18 @@ bool tp_insert(
 		bool			  indexUnchanged,
 		struct IndexInfo *indexInfo);
 
-/* Shared document processing function */
+/* Shared document processing functions */
 bool tp_process_document_text(
 		text			  *document_text,
 		ItemPointer		   ctid,
 		Oid				   text_config_oid,
+		TpLocalIndexState *index_state,
+		Relation		   index_rel,
+		int32			  *doc_length_out,
+		uint32			   tenant_id);
+bool tp_process_document_tsvector(
+		TSVector		   tsvector,
+		ItemPointer		   ctid,
 		TpLocalIndexState *index_state,
 		Relation		   index_rel,
 		int32			  *doc_length_out,

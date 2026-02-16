@@ -18,8 +18,9 @@
  *   1: 0.0.6+ format with index_oid
  *   2: 0.5.0+ adds explicit_index flag
  *   3: 1.0.0+ adds tenant_id for multi-tenant filtering
+ *   4: 1.0.0+ adds query_config_oid for per-query language override
  */
-#define TPQUERY_VERSION 3
+#define TPQUERY_VERSION 4
 
 /*
  * Flags for TpQuery
@@ -43,6 +44,9 @@ typedef struct TpQuery
 	int32  query_text_len;			  /* length of query text */
 	uint32 tenant_id;				  /* tenant ID for filtering (0 = no
 									   * filter) */
+	Oid query_config_oid;			  /* override text config for query
+									   * tokenization (InvalidOid = use
+									   * index default) */
 	char data[FLEXIBLE_ARRAY_MEMBER]; /* payload: query text only */
 } TpQuery;
 
@@ -58,9 +62,11 @@ Datum tpquery_send(PG_FUNCTION_ARGS);
 /* Constructor functions */
 Datum to_tpquery_text(PG_FUNCTION_ARGS);
 Datum to_tpquery_text_index(PG_FUNCTION_ARGS);
+Datum to_tpquery_text_index_language(PG_FUNCTION_ARGS);
 
 /* Operator functions */
 Datum bm25_text_bm25query_score(PG_FUNCTION_ARGS);
+Datum bm25_tsvector_bm25query_score(PG_FUNCTION_ARGS);
 Datum bm25_text_text_score(PG_FUNCTION_ARGS);
 Datum tpquery_eq(PG_FUNCTION_ARGS);
 
@@ -75,4 +81,5 @@ char *get_tpquery_text(TpQuery *tpquery);
 bool  tpquery_has_index(TpQuery *tpquery);
 bool  tpquery_is_explicit_index(TpQuery *tpquery);
 uint32	 get_tpquery_tenant_id(TpQuery *tpquery);
+Oid		 get_tpquery_config_oid(TpQuery *tpquery);
 TpQuery *create_tpquery_with_tenant(TpQuery *original, uint32 tenant_id);
