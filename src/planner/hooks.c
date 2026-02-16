@@ -862,6 +862,12 @@ try_inject_tenant_into_opexpr(
 	new_tpquery			  = create_tpquery_with_tenant(tpquery, tenant_id);
 	constNode->constvalue = PointerGetDatum(new_tpquery);
 	constNode->constlen	  = VARSIZE(new_tpquery);
+
+	elog(DEBUG1,
+		 "BM25 tenant injection (parse): injected tenant_id=%u "
+		 "into bm25query for index %u",
+		 tenant_id,
+		 index_oid);
 }
 
 /*
@@ -1797,8 +1803,23 @@ inject_tenant_in_indexpaths(
 					continue;
 
 				right = lsecond(opexpr->args);
+
+				/* Fold FuncExpr to Const if needed */
+				if (IsA(right, FuncExpr))
+				{
+					right = eval_const_expressions(NULL, right);
+					if (IsA(right, Const))
+						lsecond(opexpr->args) = right;
+				}
+
 				if (!IsA(right, Const))
+				{
+					elog(DEBUG1,
+						 "BM25 tenant injection (pathlist): "
+						 "skipping non-Const arg (type %d)",
+						 nodeTag(right));
 					continue;
+				}
 
 				constNode = (Const *)right;
 				if (constNode->consttype != oids->tpquery_type_oid ||
@@ -1815,6 +1836,13 @@ inject_tenant_in_indexpaths(
 				new_tpquery = create_tpquery_with_tenant(tpquery, tenant_id);
 				constNode->constvalue = PointerGetDatum(new_tpquery);
 				constNode->constlen	  = VARSIZE(new_tpquery);
+
+				elog(DEBUG1,
+					 "BM25 tenant injection (pathlist): "
+					 "injected tenant_id=%u into bm25query "
+					 "for index %u",
+					 tenant_id,
+					 index_oid);
 			}
 		}
 	}

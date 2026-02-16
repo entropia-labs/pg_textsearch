@@ -405,6 +405,13 @@ tp_rescan_process_orderby(
 				query_index_oid = get_tpquery_index_oid(query);
 				so->tenant_id	= get_tpquery_tenant_id(query);
 
+				elog(DEBUG1,
+					 "BM25 rescan: tenant_id=%u, index_oid=%u, "
+					 "query='%s'",
+					 so->tenant_id,
+					 query_index_oid,
+					 query_cstr);
+
 				/* Validate index OID if provided in query */
 				if (tpquery_has_index(query))
 				{
